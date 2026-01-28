@@ -1,0 +1,15 @@
+services:
+  opensearch_fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/pranavnbapat/opensearch_fastapi:v2
+    container_name: opensearch_fastapi
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "10000:10000"
+#    volumes:
+#      - ./models_cache:/root/.cache/huggingface/transformers
+
