@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 
@@ -23,10 +24,13 @@ from services.search_endpoint_helpers import maybe_translate_query, resolve_auth
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
                             fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump)
+from tools.debug_llm_summary import build_llm_summary_from_explain_top3
+from tools.llm_explain_client import explain_debug_non_technical
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 # ch_logger = make_default_clickhouse_logger()
 
@@ -393,6 +397,28 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
                 for h in raw_hits[:3]
                 if h.get("_explanation") is not None
             ]
+
+            # Optional: ask LLM to explain the debug in non-technical language
+            if bool(getattr(request, "debug_llm_explain", False)):
+                try:
+                    llm_input = build_llm_summary_from_explain_top3(debug_obj["explain_top3"])
+                    llm_out = explain_debug_non_technical(llm_input, timeout_s=30)
+
+                    if llm_out:
+                        # Keep raw text for copy/paste
+                        # debug_obj["llm_explanation"] = llm_out
+
+                        # Add a JSON-friendly version (no ugly \n when inspected)
+                        debug_obj["llm_explanation_lines"] = llm_out.splitlines()
+
+                        # Optional: a single-line version (handy for logs/headers)
+                        # debug_obj["llm_explanation_one_line"] = " ".join(llm_out.split())
+
+                    else:
+                        debug_obj["llm_explanation_error"] = "LLM not configured (set LLM_URL and LLM_MODEL)."
+                except Exception as e:
+                    # Don't break search if LLM fails
+                    debug_obj["llm_explanation_error"] = str(e)
 
         # Optional: persist debug to disk
         if bool(getattr(request, "debug_save", False)):

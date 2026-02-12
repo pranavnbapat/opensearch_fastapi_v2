@@ -275,6 +275,7 @@ def recommend_similar_knn(
         "date_of_completion",
         "project_acronym",
         "project_id",
+        "topics",
     ]
 
     # 2) Build query depending on mode/space
@@ -478,6 +479,7 @@ def _format_recommender_response(response: Dict[str, Any]) -> Dict[str, Any]:
             "keywords": src.get("keywords"),
             "project_acronym": src.get("project_acronym"),
             "project_id": src.get("project_id"),
+            "topics": src.get("topics"),
         }
 
         # Only include full text when requested

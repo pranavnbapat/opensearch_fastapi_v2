@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 
@@ -16,6 +17,8 @@ try:
     import requests
 except ImportError:
     requests = None
+
+from dotenv import load_dotenv
 
 
 # ----------------------------- Parsing helpers -----------------------------
@@ -48,6 +51,12 @@ def _get(obj: Any, path: str) -> Any:
             return None
         cur = cur[part]
     return cur
+
+
+def _load_repo_env() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    env_path = repo_root / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
 
 
 def _find_first_debug_root(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -400,14 +409,19 @@ def _llm_explain(
 # ----------------------------- Main -----------------------------
 
 def main() -> int:
+    _load_repo_env()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="infile", required=True, help="Path to JSON file containing _debug output")
     ap.add_argument("--hits-path", default="explain_top3", help="Dot-path inside _debug to the hits list")
     ap.add_argument("--top", type=int, default=12, help="How many top contributions to print")
-    ap.add_argument("--csv", default=None, help="Write BM25 contributions to this CSV path (also writes *_hybrid_signals.csv)")
-    ap.add_argument("--llm-url", default="https://26ttp824nm2v9a-8000.proxy.runpod.net", help="Chat-completions URL (OpenAI-compatible)")
-    ap.add_argument("--llm-model", default="qwen3-30b-a3b-awq", help="Model name for your LLM endpoint")
-    ap.add_argument("--llm-key", default=None, help="Bearer token, if required by your LLM endpoint")
+    ap.add_argument("--csv", default=None,
+                    help="Write BM25 contributions to this CSV path (also writes *_hybrid_signals.csv)")
+    ap.add_argument("--llm-url", default=os.getenv("LLM_URL"),
+                    help="Chat-completions base URL (OpenAI-compatible).")
+    ap.add_argument("--llm-model", default=os.getenv("LLM_MODEL"), help="Model name.")
+    ap.add_argument("--llm-key", default=os.getenv("LLM_KEY", None), help="Bearer token, if required.")
+
     args = ap.parse_args()
 
     payload = _load_json(Path(args.infile))
@@ -452,7 +466,7 @@ def main() -> int:
         print(f"Wrote CSV: {Path(args.csv).with_name(Path(args.csv).stem + '_hybrid_signals.csv')}")
 
     # Optional LLM explanation of the extracted summary
-    if args.llm_url:
+    if args.llm_url and args.llm_url.strip():
         # Create a compact summary for the LLM: top contributions across all hits
         lines: List[str] = []
         lines.append("Extracted debug summary (BM25 term contributions):")

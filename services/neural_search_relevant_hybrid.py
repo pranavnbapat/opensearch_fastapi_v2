@@ -78,8 +78,9 @@ class RelevantSearchRequestHybrid(BaseModel):
     include_summary: Optional[bool] = False
     debug_profile: Optional[bool] = False
     debug_explain: Optional[bool] = False
-    debug_analyze: Optional[bool] = False
-    debug_field: Optional[str] = None
+    debug_llm_explain: Optional[bool] = False
+    debug_analyze: Optional[bool] = False       # Currently not being used
+    debug_field: Optional[str] = None           # Currently, can't be used as it depends on debug_analyze
     debug_save: Optional[bool] = False
     debug_save_dir: Optional[str] = None
     sort_by: Optional[Union[SortBy, int, str]] = SortBy.score_desc
