@@ -1,14 +1,17 @@
 # services/search_endpoint_helpers.py
 
 import logging
+import time
 
 from typing import Any, Dict, Optional
 
+from services.clickhouse_logger import build_search_event
 from services.language_detect import detect_language, translate_text_with_backoff, DEEPL_SUPPORTED_LANGUAGES
 from services.utils import is_translation_allowed, jwt_claim, PAGE_SIZE, fetch_chunks_for_parents
 
 
 logger = logging.getLogger(__name__)
+
 
 def maybe_translate_query(query: str, translation_allowed: bool) -> str:
     """
@@ -38,6 +41,7 @@ def maybe_translate_query(query: str, translation_allowed: bool) -> str:
                 detected_lang, detected_lang.upper() in DEEPL_SUPPORTED_LANGUAGES)
     return query
 
+
 async def resolve_auth_context(access_token: Optional[str], dev: bool, include_summary_flag: bool):
     """
     Returns: (translation_allowed, include_summary, user_id)
@@ -54,6 +58,7 @@ async def resolve_auth_context(access_token: Optional[str], dev: bool, include_s
     include_summary = bool(include_summary_flag) and bool(access_token) and bool(translation_allowed) and (user_id is not None)
 
     return translation_allowed, include_summary, user_id
+
 
 async def build_response_json(
     response: Dict[str, Any],
@@ -169,3 +174,83 @@ async def build_response_json(
         "related_projects_from_entire_resultset": related_projects_all,
         "pagination": pagination,
     }
+
+
+async def log_search_event(
+    ch_logger,
+    request_temp,
+    endpoint: str,
+    original_query: str,
+    query: str,
+    detected_lang: str,
+    translated: bool,
+    translation_allowed: bool,
+    user_id: Optional[int],
+    model_key: str,
+    index_name: str,
+    use_semantic: bool,
+    filters: Dict[str, Any],
+    response_json: Dict[str, Any],
+    request_k: Optional[int],
+    t0: float,
+) -> None:
+    """
+    Helper to log search events to ClickHouse.
+    Non-blocking: failures are caught and logged but not raised.
+    """
+    if ch_logger is None:
+        return
+
+    try:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        # IP + headers (Traefik/proxies)
+        xff = request_temp.headers.get("x-forwarded-for", "")
+        ip = (xff.split(",")[0].strip() if xff else (request_temp.client.host if request_temp.client else ""))
+
+        user_agent = request_temp.headers.get("user-agent", "")
+        accept_language = request_temp.headers.get("accept-language", "")
+        referer = request_temp.headers.get("referer", "")
+
+        request_id = request_temp.headers.get("x-request-id") or request_temp.headers.get("x-correlation-id")
+
+        MAX_LOG_RESULTS = 10
+        results_data = response_json.get("data", [])
+        result_orig_ids = [
+            item.get("_id")
+            for item in results_data
+            if item.get("_id")
+        ][:MAX_LOG_RESULTS]
+
+        logger.info("Logging %d result_orig_ids; first=%s", len(result_orig_ids), result_orig_ids[0] if result_orig_ids else None)
+
+        event = build_search_event(
+            endpoint=endpoint,
+            original_query=original_query,
+            final_query=query,
+            ip=ip,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            referer=referer,
+            user_id=user_id,
+            result_orig_ids=result_orig_ids,
+            page=response_json.get("pagination", {}).get("current_page", 1),
+            k=request_k,
+            model_key=model_key,
+            index_name=index_name,
+            use_semantic=use_semantic,
+            translation_allowed=translation_allowed,
+            detected_lang=detected_lang,
+            translated=translated,
+            filters=filters,
+            status_code=200,
+            latency_ms=latency_ms,
+            results_count=len(results_data),
+            total_records=response_json.get("pagination", {}).get("total_records"),
+            request_id=request_id,
+        )
+
+        # Never break search if analytics logging fails
+        ch_logger.log_event(event)
+    except Exception as e:
+        logger.warning("ClickHouse logging failed: %s", e)

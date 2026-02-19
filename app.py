@@ -3,9 +3,9 @@
 import logging
 import os
 import re
-# import time
+import time
 
-# from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -13,14 +13,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 
-# from services.clickhouse_logger import make_default_clickhouse_logger, build_search_event
+from services.clickhouse_logger import make_default_clickhouse_logger, build_search_event
 from services.neural_search_relevant import neural_search_relevant, RelevantSearchRequest
 from services.neural_search_relevant_hybrid import neural_search_relevant_hybrid, RelevantSearchRequestHybrid
 from services.neural_search_relevant_sparse import neural_search_relevant_sparse
 from services.neural_search_relevant_new import (neural_search_relevant_new, split_query_into_fragments,
                                                  RelevantSearchRequestNew, score_chunk_for_fragments, )
 from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
-from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json
+from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
                             fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump)
@@ -32,18 +32,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# ch_logger = make_default_clickhouse_logger()
+ch_logger = make_default_clickhouse_logger()
 
 
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     # Start the background ClickHouse flush task
-#     await ch_logger.start()
-#     try:
-#         yield
-#     finally:
-#         # Flush remaining events and close http client
-#         await ch_logger.stop()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the background ClickHouse flush task
+    await ch_logger.start()
+    try:
+        yield
+    finally:
+        # Flush remaining events and close http client
+        await ch_logger.stop()
 
 
 ALLOWED_USERS = {
@@ -57,7 +57,7 @@ ALLOWED_USERS = {
     }
 }
 
-app = FastAPI(title="OpenSearch API", version="1.0")
+app = FastAPI(title="OpenSearch API", version="1.0", lifespan=lifespan)
 app.add_middleware(MultiUserTimedAuthMiddleware, users=ALLOWED_USERS)
 
 origins = [
@@ -100,9 +100,10 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
 
     page_number = max(request.page, 1)
 
-    query = request.search_term.strip()
+    original_query = request.search_term.strip()
+    query = original_query
 
-    # t0 = time.monotonic()
+    t0 = time.monotonic()
 
     access_token = request.access_token
 
@@ -124,7 +125,21 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
     }
 
     #------------------------------------ DeepL Translation ------------------------------------#
-    query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    # Track translation status for analytics
+    detected_lang = "en"
+    translated = False
+    
+    if translation_allowed:
+        from services.language_detect import detect_language
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+    
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
 
     # Smart fallback to BM25 if query is short
     q = query.strip()
@@ -211,60 +226,27 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         "debug_profile": bool(getattr(request, "debug_profile", False)),
     }
 
+    # Log to ClickHouse (non-blocking)
+    await log_search_event(
+        ch_logger=ch_logger,
+        request_temp=request_temp,
+        endpoint="/neural_search_relevant",
+        original_query=original_query,
+        query=query,
+        detected_lang=detected_lang,
+        translated=translated,
+        translation_allowed=translation_allowed,
+        user_id=user_id,
+        model_key=model_key,
+        index_name=index_name,
+        use_semantic=use_semantic,
+        filters=filters,
+        response_json=response_json,
+        request_k=(request.k if (getattr(request, "k", None) is not None) else None),
+        t0=t0,
+    )
+
     return response_json
-
-    # latency_ms = int((time.monotonic() - t0) * 1000)
-
-    # IP + headers (Traefik/proxies)
-    # xff = request_temp.headers.get("x-forwarded-for", "")
-    # ip = (xff.split(",")[0].strip() if xff else (request_temp.client.host if request_temp.client else ""))
-    #
-    # user_agent = request_temp.headers.get("user-agent", "")
-    # accept_language = request_temp.headers.get("accept-language", "")
-    # referer = request_temp.headers.get("referer", "")
-
-    # request_id = request_temp.headers.get("x-request-id") or request_temp.headers.get("x-correlation-id")
-
-    # MAX_LOG_RESULTS = 10
-    # result_orig_ids = [
-    #     item.get("_id")
-    #     for item in formatted_results
-    #     if item.get("_id")
-    # ][:MAX_LOG_RESULTS]
-
-    # logger.info("Logging %d result_orig_ids; first=%s", len(result_orig_ids), result_orig_ids[0] if result_orig_ids else None)
-
-    # event = build_search_event(
-    #     endpoint="/neural_search_relevant",
-    #     original_query=original_query,
-    #     final_query=query,
-    #     ip=ip,
-    #     user_agent=user_agent,
-    #     accept_language=accept_language,
-    #     referer=referer,
-    #     user_id=user_id,
-    #     result_orig_ids=result_orig_ids,
-    #     page=page_number,
-    #     k=(request.k if (getattr(request, "k", None) is not None) else None),
-    #     model_key=model_key,
-    #     index_name=index_name,
-    #     use_semantic=use_semantic,
-    #     translation_allowed=translation_allowed,
-    #     detected_lang=detected_lang,
-    #     translated=translated,
-    #     filters=filters,
-    #     status_code=200,
-    #     latency_ms=latency_ms,
-    #     results_count=len(formatted_results),
-    #     total_records=response_json.get("pagination", {}).get("total_records"),
-    #     request_id=request_id,
-    # )
-
-    # Never break search if analytics logging fails
-    # try:
-    #     ch_logger.log_event(event)
-    # except Exception as e:
-    #     logger.warning("ClickHouse logging failed: %s", e)
 
 
 @app.post("/neural_search_relevant_hybrid", tags=["Search"],
@@ -287,7 +269,8 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         logger.info("Raw access_token preview=%s...%s (len=%d)", tok[:6], tok[-4:], len(tok))
 
     page_number = max(request.page, 1)
-    query = request.search_term.strip()
+    original_query = request.search_term.strip()
+    query = original_query
 
     access_token = request.access_token
 
@@ -298,7 +281,21 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
     )
 
     # ------------------------------------ DeepL Translation ------------------------------------#
-    query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    # Track translation status for analytics
+    detected_lang = "en"
+    translated = False
+    
+    if translation_allowed:
+        from services.language_detect import detect_language
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+    
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
 
     filters = {
         "topics": request.topics,
@@ -320,7 +317,9 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
 
     model_id = model_config["model_id"]
 
-    # ---- Compute debug flags ----
+    # ---- Timing & debug flags ----
+    t0 = time.monotonic()
+    
     debug_explain = bool(getattr(request, "debug_explain", False))
     debug_profile = bool(getattr(request, "debug_profile", False))
     debug_analyze = bool(getattr(request, "debug_analyze", False))
@@ -435,6 +434,26 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
             )
             debug_obj["saved_to"] = debug_path
 
+    # Log to ClickHouse (non-blocking)
+    await log_search_event(
+        ch_logger=ch_logger,
+        request_temp=request_temp,
+        endpoint="/neural_search_relevant_hybrid",
+        original_query=original_query,
+        query=query,
+        detected_lang=detected_lang,
+        translated=translated,
+        translation_allowed=translation_allowed,
+        user_id=user_id,
+        model_key=model_key,
+        index_name=index_name,
+        use_semantic=True,  # Hybrid always uses semantic
+        filters=filters,
+        response_json=response_json,
+        request_k=(request.k if (getattr(request, "k", None) is not None) else None),
+        t0=t0,
+    )
+
     return response_json
 
 
@@ -457,7 +476,8 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
         logger.info("Raw access_token preview=%s...%s (len=%d)", tok[:6], tok[-4:], len(tok))
 
     page_number = max(request.page, 1)
-    query = request.search_term.strip()
+    original_query = request.search_term.strip()
+    query = original_query
 
     access_token = request.access_token
 
@@ -468,7 +488,21 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
     )
 
     # ---------------- DeepL Translation ----------------
-    query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    # Track translation status for analytics
+    detected_lang = "en"
+    translated = False
+    
+    if translation_allowed:
+        from services.language_detect import detect_language
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+    
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
 
     filters = {
         "topics": request.topics,
@@ -487,6 +521,8 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
 
     if request.dev:
         index_name += "_dev"
+
+    t0 = time.monotonic()
 
     response = neural_search_relevant_sparse(
         index_name=index_name,
@@ -512,6 +548,26 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
 
     logger.info("[SPARSE] Search Query: '%s', Index: %s, Page: %d, Analyzer: %s",
                 query, index_name, page_number, "bert-uncased")
+
+    # Log to ClickHouse (non-blocking)
+    await log_search_event(
+        ch_logger=ch_logger,
+        request_temp=request_temp,
+        endpoint="/neural_search_relevant_sparse",
+        original_query=original_query,
+        query=query,
+        detected_lang=detected_lang,
+        translated=translated,
+        translation_allowed=translation_allowed,
+        user_id=user_id,
+        model_key=model_key,
+        index_name=index_name,
+        use_semantic=True,  # Sparse search is semantic
+        filters=filters,
+        response_json=response_json,
+        request_k=(request.k if (getattr(request, "k", None) is not None) else None),
+        t0=t0,
+    )
 
     return response_json
 

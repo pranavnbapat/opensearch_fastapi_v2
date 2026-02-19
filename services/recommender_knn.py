@@ -279,13 +279,10 @@ def recommend_similar_knn(
     ]
 
     # 2) Build query depending on mode/space
+    # NOTE: inner_hits removed due to OpenSearch Neural Search plugin bug
+    # with script_score + collapse + inner_hits causing NullPointerException
     collapse_block = {
         "field": "parent_id",
-        "inner_hits": {
-            "name": "best_chunks",
-            "size": 1,
-            "_source": ["chunk_index", "content_chunk"],
-        },
     }
 
     if use_ann:
@@ -392,17 +389,31 @@ def recommend_similar_knn(
             "collapse": collapse_block,
         }
 
-        response = client.search(index=index_name, body=search_query)
-
-    try:
-        pass
-    except TransportError as e:
-        logger.exception("k-NN recommender search failed: %s", e)
-        detail = getattr(e, "info", None) or {"error": str(e)}
-        raise HTTPException(status_code=502, detail={
-            "message": "OpenSearch k-NN recommender search failed",
-            "opensearch": detail,
-        })
+        try:
+            response = client.search(
+                index=index_name,
+                body=search_query,
+                params={"error_trace": "true"},
+            )
+        except TransportError as e:
+            logger.exception(
+                "k-NN recommender search failed: %s | info=%s",
+                e,
+                getattr(e, "info", None),
+            )
+            error_info = getattr(e, "info", {}) or {}
+            error_root = error_info.get("error", {}) if isinstance(error_info, dict) else {}
+            error_reason = error_root.get("reason", str(e)) if isinstance(error_root, dict) else str(e)
+            return {
+                "meta": {
+                    "error": "k-NN search failed",
+                    "reason": error_reason,
+                    "seed_parent_id": parent_id,
+                    "mode": mode,
+                    "space": space,
+                },
+                "data": [],
+            }
 
     hits = response.get("hits", {}).get("hits", []) or []
 
