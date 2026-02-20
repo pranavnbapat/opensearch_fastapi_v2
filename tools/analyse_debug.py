@@ -420,7 +420,7 @@ def main() -> int:
     ap.add_argument("--llm-url", default=os.getenv("LLM_URL"),
                     help="Chat-completions base URL (OpenAI-compatible).")
     ap.add_argument("--llm-model", default=os.getenv("LLM_MODEL"), help="Model name.")
-    ap.add_argument("--llm-key", default=os.getenv("LLM_KEY", None), help="Bearer token, if required.")
+    ap.add_argument("--llm-key", default=os.getenv("LLM_API_KEY") or os.getenv("LLM_KEY"), help="Bearer token, if required.")
 
     args = ap.parse_args()
 

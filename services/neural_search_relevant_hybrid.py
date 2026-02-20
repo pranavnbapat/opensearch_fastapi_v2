@@ -304,8 +304,8 @@ def neural_search_relevant_hybrid(
         hits = response.get("hits", {}).get("hits", [])
         logger.info("[HYBRID DEBUG] returned_hits=%d page_size=%d from=%d",
                     len(hits), page_size, from_offset)
-        logger.info("[HYBRID DEBUG] sample parent_ids=%s",
-                    [h.get("_source", {}).get("parent_id") for h in hits[:10]])
+        # logger.info("[HYBRID DEBUG] sample parent_ids=%s",
+        #             [h.get("_source", {}).get("parent_id") for h in hits[:10]])
 
 
     except TransportError as e:

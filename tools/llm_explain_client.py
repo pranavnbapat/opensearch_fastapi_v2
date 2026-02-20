@@ -11,7 +11,8 @@ import requests
 def explain_debug_non_technical(text: str, timeout_s: int = 30) -> Optional[str]:
     llm_url = (os.getenv("LLM_URL") or "").strip()
     llm_model = (os.getenv("LLM_MODEL") or "").strip()
-    llm_key = (os.getenv("LLM_KEY") or "").strip() or None
+    # Support both LLM_API_KEY (new) and LLM_KEY (legacy) for backward compatibility
+    llm_key = (os.getenv("LLM_API_KEY") or os.getenv("LLM_KEY") or "").strip() or None
 
     if not llm_url or not llm_model:
         return None  # not configured
