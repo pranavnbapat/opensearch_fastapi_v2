@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 
-from services.clickhouse_logger import make_default_clickhouse_logger, build_search_event
+from services.clickhouse_logger import make_default_clickhouse_logger
 from services.neural_search_relevant import neural_search_relevant, RelevantSearchRequest
 from services.neural_search_relevant_advanced import (
     neural_search_relevant as neural_search_relevant_advanced,
@@ -36,18 +36,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-ch_logger = make_default_clickhouse_logger()
+# Temporarily disable ClickHouse analytics logging at the app level.
+# Endpoints still call log_search_event(), but it will no-op when ch_logger is None.
+ch_logger = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start the background ClickHouse flush task
-    await ch_logger.start()
     try:
         yield
     finally:
-        # Flush remaining events and close http client
-        await ch_logger.stop()
+        pass
 
 
 ALLOWED_USERS = {
@@ -86,6 +85,12 @@ HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lo
 
 @app.post("/neural_search_relevant", tags=["Search"],
           summary="Semantic-first search with lexical boosting",
+          response_description="Parent-grouped search results with pagination and optional debug metadata.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
           description="""
           Performs semantic-first search using neural vector similarity across multiple document fields
           (title, subtitle, description, keywords, and content), with lexical boosting for exact term and
@@ -249,13 +254,18 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
 
 @app.post("/neural_search_relevant_advanced", tags=["Search"],
           summary="Experimental advanced boolean-aware search",
+          response_description="Parent-grouped advanced search results with pagination and optional debug metadata.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
           description="""
-          Experimental advanced search endpoint with boolean-aware query parsing.
-          Supports explicit AND, OR, NOT, parentheses, quoted phrases, and inline project scoping with
-          -project/--project. Positive clauses combine lexical evidence with semantic retrieval. Negative clauses
-          are applied lexically for safer exclusion behavior.
-          This endpoint is isolated from /neural_search_relevant so advanced experiments do not disturb the
-          production default endpoint.
+          Experimental search endpoint for advanced query syntax. When `advanced=true`, it supports explicit
+          uppercase boolean operators (`AND`, `OR`, `NOT`), parentheses, quoted phrases, field-scoped clauses,
+          project scoping, and mode controls. Positive clauses use semantic and lexical evidence; negative clauses
+          use lexical exclusion for predictable behavior. When `advanced=false`, this endpoint falls back to the
+          same retrieval behavior as `/neural_search_relevant`.
           """)
 async def neural_search_relevant_advanced_endpoint(request_temp: Request, request: RelevantSearchRequestAdvanced):
     try:
@@ -433,11 +443,17 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
 
 @app.post("/neural_search_relevant_hybrid", tags=["Search"],
           summary="Hybrid search with BM25–neural score normalisation",
+          response_description="Parent-grouped hybrid search results with pagination and optional debug metadata.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
           description="""
-          Executes a hybrid search combining BM25 keyword matching and neural vector similarity, then applies a search 
-          pipeline to normalise and merge scores from both retrieval methods.
-          This endpoint is optimised for stable, comparable ranking across heterogeneous queries by letting OpenSearch 
-          handle score blending and normalisation at the pipeline level.
+          Executes an OpenSearch hybrid query that combines a BM25 branch and a neural branch, then optionally applies
+          a configured search pipeline to normalize and merge the scores. Query-intent routing is still applied before
+          the hybrid query is built. Results are grouped at the parent document level. This endpoint is experimental
+          relative to `/neural_search_relevant` and is mainly useful when you want OpenSearch-side score fusion.
           """)
 async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request: RelevantSearchRequestHybrid):
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
@@ -645,10 +661,16 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
 
 @app.post("/neural_search_relevant_sparse", tags=["Search"],
           summary="Neural sparse search (separate from hybrid)",
+          response_description="Parent-grouped sparse semantic search results with pagination.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
           description="""
-          Executes a neural sparse search against the `content_sparse` rank_features field.
-          Uses doc-only sparse mode: query-time uses the compatible analyzer (bert-uncased).
-          Results are grouped at the parent document level.
+          Executes sparse neural retrieval against the `content_sparse` field using the query-time analyzer
+          `bert-uncased`. This endpoint is separate from the hybrid pipeline and is intended for sparse semantic
+          retrieval experiments. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_sparse_endpoint(request_temp: Request, request: RelevantSearchRequest):
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
@@ -759,10 +781,17 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
 
 
 @app.post("/recommend_similar_knn", tags=["Recommend"],
-          summary="Semantic k-NN recommendations for a clicked KO",
+          summary="Semantic similar-item recommendations for a KO",
+          response_description="Similar parent knowledge objects for the given seed KO.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
           description="""
-          Given a clicked knowledge object (parent_id), returns top-k similar KOs using k-NN vector similarity.
-          No filters are applied: this is pure nearest-neighbour recommendation.
+          Given a seed knowledge object (`parent_id`), returns semantically similar parent KOs using vector
+          similarity from the seed meta document. Supports exact or ANN retrieval and can use content, title,
+          description, keywords, or a weighted mix of embedding spaces. No request-time filters are applied.
           """)
 async def recommend_similar_knn_endpoint(request: RecommendKNNRequest):
     parent_id = request.parent_id.strip()
@@ -799,14 +828,19 @@ async def recommend_similar_knn_endpoint(request: RecommendKNNRequest):
 
 
 @app.post("/neural_search_relevant_new", tags=["Search"],
-          summary="Context-aware neural search with smart fallback",
-          description="""Performs semantic relevance-based search using one of the supported models and retrieves 
-          contextually matched documents. Supported semantic models:
-          - `msmarco` (default)
-          - `mpnetv2`
-          - `minilml12v2`
-          You can optionally pass `model` (default is `msmarco`) and `k` to get only the top-k ranked results 
-          (no pagination).""")
+          summary="Experimental fragment-aware neural search",
+          response_description="Parent-grouped fragment-aware search results with pagination.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
+          description="""
+          Experimental search endpoint that splits the query into fragments, retrieves candidate parent documents,
+          and can re-score returned chunks against those fragments when full text is requested. It uses a simple
+          short-query fallback heuristic and is separate from the current default `/neural_search_relevant`
+          endpoint.
+          """)
 async def neural_search_relevant_endpoint_new(request_temp: Request, request: RelevantSearchRequestNew):
     page_number = max(request.page, 1)
 
