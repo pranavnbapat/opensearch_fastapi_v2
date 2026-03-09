@@ -14,6 +14,10 @@ from starlette.middleware.cors import CORSMiddleware
 
 from services.clickhouse_logger import make_default_clickhouse_logger, build_search_event
 from services.neural_search_relevant import neural_search_relevant, RelevantSearchRequest
+from services.neural_search_relevant_advanced import (
+    neural_search_relevant as neural_search_relevant_advanced,
+    RelevantSearchRequest as RelevantSearchRequestAdvanced,
+)
 from services.neural_search_relevant_hybrid import neural_search_relevant_hybrid, RelevantSearchRequestHybrid
 from services.neural_search_relevant_sparse import neural_search_relevant_sparse
 from services.neural_search_relevant_new import (neural_search_relevant_new, split_query_into_fragments,
@@ -216,6 +220,168 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         ch_logger=ch_logger,
         request_temp=request_temp,
         endpoint="/neural_search_relevant",
+        original_query=original_query,
+        query=query,
+        detected_lang=detected_lang,
+        translated=translated,
+        translation_allowed=translation_allowed,
+        user_id=user_id,
+        model_key=model_key,
+        index_name=index_name,
+        use_semantic=use_semantic,
+        filters=filters,
+        response_json=response_json,
+        request_k=(request.k if (getattr(request, "k", None) is not None) else None),
+        t0=t0,
+    )
+
+    return response_json
+
+
+@app.post("/neural_search_relevant_advanced", tags=["Search"],
+          summary="Experimental advanced boolean-aware search",
+          description="""
+          Experimental advanced search endpoint with boolean-aware query parsing.
+          Supports explicit AND, OR, NOT, parentheses, quoted phrases, and inline project scoping with
+          -project/--project. Positive clauses combine lexical evidence with semantic retrieval. Negative clauses
+          are applied lexically for safer exclusion behavior.
+          This endpoint is isolated from /neural_search_relevant so advanced experiments do not disturb the
+          production default endpoint.
+          """)
+async def neural_search_relevant_advanced_endpoint(request_temp: Request, request: RelevantSearchRequestAdvanced):
+    try:
+        raw_payload = await request_temp.json()
+    except Exception:
+        raw_payload = None
+
+    if isinstance(raw_payload, dict) and raw_payload.get("access_token"):
+        tok = str(raw_payload["access_token"])
+        logger.info("Raw access_token preview=%s...%s (len=%d)", tok[:6], tok[-4:], len(tok))
+
+    page_number = max(request.page, 1)
+
+    original_query = request.search_term.strip()
+    query = original_query
+
+    t0 = time.monotonic()
+
+    access_token = request.access_token
+
+    translation_allowed, include_summary, user_id = await resolve_auth_context(
+        access_token=access_token,
+        dev=bool(request.dev),
+        include_summary_flag=bool(getattr(request, "include_summary", False)),
+    )
+
+    filters = {
+        "topics": request.topics,
+        "themes": request.themes,
+        "languages": request.languages,
+        "category": request.category,
+        "project_type": request.project_type,
+        "project_acronym": request.project_acronym,
+        "locations": request.locations,
+        "sort_by": getattr(request, "sort_by", None)
+    }
+
+    detected_lang = "en"
+    translated = False
+
+    if translation_allowed:
+        from services.language_detect import detect_language
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
+
+    use_semantic, _, _, _, _ = infer_query_intent(
+        query,
+        code_hint_env="QUERY_CODE_HINT_REGEX",
+        acronym_min_len_env="QUERY_ACRONYM_MIN_LEN",
+        acronym_max_len_env="QUERY_ACRONYM_MAX_LEN",
+        acronym_min_caps_env="QUERY_ACRONYM_MIN_CAPS",
+    )
+
+    model_key = request.model.lower().strip() if request.model else "msmarco"
+    model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
+    index_name = model_config["index"]
+
+    if request.dev:
+        index_name += "_dev"
+
+    model_id = model_config["model_id"]
+
+    advanced_enabled = bool(getattr(request, "advanced", True))
+
+    if advanced_enabled:
+        response = neural_search_relevant_advanced(
+            index_name=index_name,
+            query=query,
+            filters=filters,
+            page=page_number,
+            model_id=model_id,
+            use_semantic=use_semantic,
+            size_override=None,
+            debug_profile=bool(getattr(request, "debug_profile", False)),
+            debug_explain=bool(getattr(request, "debug_explain", False)),
+        )
+    else:
+        response = neural_search_relevant(
+            index_name=index_name,
+            query=query,
+            filters=filters,
+            page=page_number,
+            model_id=model_id,
+            use_semantic=use_semantic,
+            size_override=None,
+            debug_profile=bool(getattr(request, "debug_profile", False)),
+            debug_explain=bool(getattr(request, "debug_explain", False)),
+        )
+
+    include_fulltext = bool(getattr(request, "include_fulltext", False))
+
+    response_json = await build_response_json(
+        response=response,
+        index_name=index_name,
+        page_number=page_number,
+        include_fulltext=include_fulltext,
+        include_summary=include_summary,
+        query=query,
+        summary_provider=SUMMARY_PROVIDER,
+        summarise_top5_hf_fn=summarise_top5_hf,
+    )
+
+    logger.info("Advanced Search Query: '%s', Advanced: %s, Semantic: %s, Index: %s, Page: %d",
+                query, advanced_enabled, use_semantic, index_name, page_number)
+
+    if bool(getattr(request, "debug_explain", False)):
+        raw_hits = (response or {}).get("hits", {}).get("hits", [])
+        response_json["_debug"] = response_json.get("_debug", {})
+        response_json["_debug"]["explain_top3"] = [
+            {
+                "_id": h.get("_id"),
+                "_score": h.get("_score"),
+                "parent_id": (h.get("_source") or {}).get("parent_id"),
+                "_explanation": h.get("_explanation"),
+            }
+            for h in raw_hits[:3]
+        ]
+
+    response_json["_debug"] = response_json.get("_debug", {})
+    response_json["_debug"]["request_flags"] = {
+        "debug_explain": bool(getattr(request, "debug_explain", False)),
+        "debug_profile": bool(getattr(request, "debug_profile", False)),
+    }
+
+    await log_search_event(
+        ch_logger=ch_logger,
+        request_temp=request_temp,
+        endpoint="/neural_search_relevant_advanced",
         original_query=original_query,
         query=query,
         detected_lang=detected_lang,
