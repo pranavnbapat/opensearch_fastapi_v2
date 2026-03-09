@@ -17,6 +17,7 @@ from services.neural_search_relevant import neural_search_relevant, RelevantSear
 from services.neural_search_relevant_advanced import (
     neural_search_relevant as neural_search_relevant_advanced,
     RelevantSearchRequest as RelevantSearchRequestAdvanced,
+    build_advanced_clause_debug_for_hits,
 )
 from services.neural_search_relevant_hybrid import neural_search_relevant_hybrid, RelevantSearchRequestHybrid
 from services.neural_search_relevant_sparse import neural_search_relevant_sparse
@@ -27,7 +28,7 @@ from services.search_endpoint_helpers import maybe_translate_query, resolve_auth
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
                             fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent)
-from tools.debug_llm_summary import build_llm_summary_from_explain_top3
+from tools.debug_llm_summary import build_llm_summary_from_explain_top3, build_llm_summary_from_advanced_matches
 from tools.llm_explain_client import explain_debug_non_technical
 
 
@@ -208,6 +209,14 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
             for h in raw_hits[:3]
         ]
 
+        try:
+            llm_input = build_llm_summary_from_explain_top3(response_json["_debug"]["explain_top3"])
+            llm_out = explain_debug_non_technical(llm_input, timeout_s=30)
+            if llm_out:
+                response_json["_debug"]["llm_explanation_lines"] = llm_out.splitlines()
+        except Exception:
+            pass
+
     # Optional: show whether OpenSearch even received explain/profile flags
     response_json["_debug"] = response_json.get("_debug", {})
     response_json["_debug"]["request_flags"] = {
@@ -372,6 +381,28 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
             for h in raw_hits[:3]
         ]
 
+        if advanced_enabled:
+            parsed_query = ((response_json.get("_meta") or {}).get("advanced_search") or {}).get("parsed_query")
+            clause_debug_by_parent = build_advanced_clause_debug_for_hits(parsed_query or {}, raw_hits)
+            if clause_debug_by_parent:
+                for item in response_json.get("data", []):
+                    parent_id = item.get("_id")
+                    if parent_id in clause_debug_by_parent:
+                        item["_debug"] = item.get("_debug", {})
+                        item["_debug"]["matched_clauses"] = clause_debug_by_parent[parent_id]
+
+                try:
+                    llm_input = build_llm_summary_from_advanced_matches(
+                        query=query,
+                        parsed_query=parsed_query or {},
+                        results=response_json.get("data", []),
+                    )
+                    llm_out = explain_debug_non_technical(llm_input, timeout_s=30)
+                    if llm_out:
+                        response_json["_debug"]["llm_explanation_lines"] = llm_out.splitlines()
+                except Exception:
+                    pass
+
     response_json["_debug"] = response_json.get("_debug", {})
     response_json["_debug"]["request_flags"] = {
         "debug_explain": bool(getattr(request, "debug_explain", False)),
@@ -486,8 +517,6 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
     
     debug_explain = bool(getattr(request, "debug_explain", False))
     debug_profile = bool(getattr(request, "debug_profile", False))
-    debug_analyze = bool(getattr(request, "debug_analyze", False))
-    debug_field = getattr(request, "debug_field", None)
     debug_enabled = debug_explain or debug_profile
 
     response = neural_search_relevant_hybrid(
@@ -533,8 +562,6 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         debug_obj["request_flags"] = {
             "debug_explain": debug_explain,
             "debug_profile": debug_profile,
-            "debug_analyze": debug_analyze,
-            "debug_field": debug_field,
         }
 
         # Store OpenSearch request
@@ -570,26 +597,13 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
             ]
 
             # Optional: ask LLM to explain the debug in non-technical language
-            if bool(getattr(request, "debug_llm_explain", False)):
-                try:
-                    llm_input = build_llm_summary_from_explain_top3(debug_obj["explain_top3"])
-                    llm_out = explain_debug_non_technical(llm_input, timeout_s=30)
-
-                    if llm_out:
-                        # Keep raw text for copy/paste
-                        # debug_obj["llm_explanation"] = llm_out
-
-                        # Add a JSON-friendly version (no ugly \n when inspected)
-                        debug_obj["llm_explanation_lines"] = llm_out.splitlines()
-
-                        # Optional: a single-line version (handy for logs/headers)
-                        # debug_obj["llm_explanation_one_line"] = " ".join(llm_out.split())
-
-                    else:
-                        debug_obj["llm_explanation_error"] = "LLM not configured (set LLM_URL and LLM_MODEL)."
-                except Exception as e:
-                    # Don't break search if LLM fails
-                    debug_obj["llm_explanation_error"] = str(e)
+            try:
+                llm_input = build_llm_summary_from_explain_top3(debug_obj["explain_top3"])
+                llm_out = explain_debug_non_technical(llm_input, timeout_s=30)
+                if llm_out:
+                    debug_obj["llm_explanation_lines"] = llm_out.splitlines()
+            except Exception:
+                pass
 
         # Optional: persist debug to disk
         if bool(getattr(request, "debug_save", False)):

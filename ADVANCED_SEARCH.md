@@ -190,13 +190,21 @@ Examples:
   - parsed AST
   - project filters
   - mode
+- when `debug_explain=true`, each returned result may include:
+  - `item._debug.matched_clauses.matched_clause_tree`
+  - `item._debug.matched_clauses.source_hit_id`
+  - `item._debug.matched_clauses.score`
+- when `debug_explain=true`, the endpoint may also include:
+  - `_debug.llm_explanation_lines`
+  - only if the configured LLM is available
 
 ## Current limitations
 
 - malformed boolean queries currently return an empty result with parse metadata
 - unquoted adjacent words are grouped into one concept term
 - request-level filters and query-syntax filters can both be used, but that may be redundant
-- per-result clause-match tracing is still limited
+- per-result clause-match tracing is heuristic and source-based; it explains likely lexical/structured matches, not exact neural contribution
+- LLM explanations are optional, best-effort, and are attempted automatically when `debug_explain=true`; if unavailable, the endpoint falls back to structured debug output only
 
 ## Why this is separate
 

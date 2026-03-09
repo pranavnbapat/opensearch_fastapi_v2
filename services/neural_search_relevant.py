@@ -70,8 +70,6 @@ class RelevantSearchRequest(BaseModel):
     include_summary: Optional[bool] = False
     debug_profile: Optional[bool] = False
     debug_explain: Optional[bool] = False
-    debug_analyze: Optional[bool] = False
-    debug_field: Optional[str] = None
     sort_by: Optional[Union[SortBy, int, str]] = SortBy.score_desc
     access_token: Optional[str] = None
 

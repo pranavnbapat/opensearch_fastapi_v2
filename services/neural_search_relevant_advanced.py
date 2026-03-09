@@ -127,8 +127,6 @@ class RelevantSearchRequest(BaseModel):
     include_summary: Optional[bool] = False
     debug_profile: Optional[bool] = False
     debug_explain: Optional[bool] = False
-    debug_analyze: Optional[bool] = False
-    debug_field: Optional[str] = None
     sort_by: Optional[Union[SortBy, int, str]] = SortBy.score_desc
     access_token: Optional[str] = None
 
@@ -549,6 +547,77 @@ def _field_filter_query(field: str, value: str) -> Dict[str, Any]:
     return {"term": {mapped: value}}
 
 
+def _source_text_values(src: Dict[str, Any], field: Optional[str]) -> List[tuple[str, str]]:
+    def _as_text(v: Any) -> str:
+        if isinstance(v, list):
+            return " ".join(str(x) for x in v if x is not None)
+        return str(v or "")
+
+    if field in FIELD_QUERY_MAP:
+        field_map = {
+            "title": [("title", _as_text(src.get("title")))],
+            "subtitle": [("subtitle", _as_text(src.get("subtitle")))],
+            "description": [("description", _as_text(src.get("description")))],
+            "keywords": [("keywords", _as_text(src.get("keywords")))],
+            "content": [("content_chunk", _as_text(src.get("content_chunk")))],
+        }
+        return field_map.get(field, [])
+
+    return [
+        ("title", _as_text(src.get("title"))),
+        ("subtitle", _as_text(src.get("subtitle"))),
+        ("description", _as_text(src.get("description"))),
+        ("keywords", _as_text(src.get("keywords"))),
+        ("content_chunk", _as_text(src.get("content_chunk"))),
+        ("project_acronym", _as_text(src.get("project_acronym"))),
+        ("project_name", _as_text(src.get("project_name"))),
+    ]
+
+
+def _match_text_term(src: Dict[str, Any], term: str, field: Optional[str]) -> Dict[str, Any]:
+    needle = (term or "").strip().lower()
+    tokens = [t for t in needle.split() if t]
+    matches: List[Dict[str, str]] = []
+
+    for field_name, text in _source_text_values(src, field):
+        hay = text.lower()
+        if not hay:
+            continue
+        if len(tokens) > 1:
+            matched = needle in hay or all(tok in hay for tok in tokens)
+        else:
+            matched = needle in hay
+        if matched:
+            matches.append({"field": field_name, "match_type": "phrase" if needle in hay else "token_all"})
+
+    return {
+        "matched": bool(matches),
+        "evidence": matches,
+    }
+
+
+def _match_filter_term(src: Dict[str, Any], field: str, value: str) -> Dict[str, Any]:
+    needle = (value or "").strip().lower()
+
+    if field == "project":
+        candidates = [
+            ("project_acronym", str(src.get("project_acronym") or "")),
+            ("project_name", str(src.get("project_name") or "")),
+        ]
+        evidence = [{"field": name, "match_type": "exact_or_phrase"} for name, raw in candidates if needle and needle in raw.lower()]
+        return {"matched": bool(evidence), "evidence": evidence}
+
+    mapped = FIELD_FILTER_MAP[field]
+    raw = src.get(mapped)
+    values = raw if isinstance(raw, list) else [raw]
+    evidence = []
+    for item in values:
+        text = str(item or "").lower()
+        if text == needle or needle in text:
+            evidence.append({"field": mapped, "match_type": "exact_or_contains"})
+    return {"matched": bool(evidence), "evidence": evidence}
+
+
 def _mode_semantic_enabled(mode: Optional[str], use_semantic: bool) -> bool:
     if mode == "lexical":
         return False
@@ -739,6 +808,66 @@ def _build_advanced_query_part(
         parsed,
         _project_scope_filters(parsed.get("project_filters", [])),
     )
+
+
+def _evaluate_ast_match(node: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    node_type = node["type"]
+
+    if node_type == "TERM":
+        match_info = _match_text_term(src, node["value"], node.get("field"))
+        return {
+            "type": "TERM",
+            "value": node["value"],
+            **({"field": node["field"]} if node.get("field") else {}),
+            **({"required": True} if node.get("required") else {}),
+            **match_info,
+        }
+
+    if node_type == "FILTER":
+        match_info = _match_filter_term(src, node["field"], node["value"])
+        return {
+            "type": "FILTER",
+            "field": node["field"],
+            "value": node["value"],
+            **match_info,
+        }
+
+    if node_type == "NOT":
+        child = _evaluate_ast_match(node["child"], src)
+        return {
+            "type": "NOT",
+            "matched": not bool(child.get("matched")),
+            "child": child,
+        }
+
+    children = [_evaluate_ast_match(child, src) for child in node["children"]]
+    matched_children = [bool(child.get("matched")) for child in children]
+    matched = all(matched_children) if node_type == "AND" else any(matched_children)
+    return {
+        "type": node_type,
+        "matched": matched,
+        "children": children,
+    }
+
+
+def build_advanced_clause_debug_for_hits(parsed_query: Dict[str, Any], hits: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    ast = (parsed_query or {}).get("ast")
+    if not isinstance(ast, dict):
+        return {}
+
+    by_parent: Dict[str, Dict[str, Any]] = {}
+    for hit in hits:
+        src = hit.get("_source") or {}
+        parent_id = src.get("parent_id") or src.get("_orig_id")
+        if not parent_id or parent_id in by_parent:
+            continue
+        tree = _evaluate_ast_match(ast, src)
+        by_parent[parent_id] = {
+            "matched_clause_tree": tree,
+            "source_hit_id": hit.get("_id"),
+            "score": hit.get("_score"),
+        }
+    return by_parent
 
 
 def neural_search_relevant(
