@@ -167,13 +167,21 @@ async def build_response_json(
         # Caller ensures auth eligibility; here we just compute.
         summary = summarise_top5_hf_fn(query=query, hits=formatted_results)
 
-    return {
+    response_json = {
         "summary": summary,
         "data": formatted_results,
         "related_projects_from_this_page": related_projects_from_this_page,
         "related_projects_from_entire_resultset": related_projects_all,
         "pagination": pagination,
     }
+
+    # Preserve service-level metadata so evaluation and debugging can see
+    # whether a hybrid search pipeline was requested, used, or bypassed.
+    meta = response.get("_meta")
+    if isinstance(meta, dict) and meta:
+        response_json["_meta"] = meta
+
+    return response_json
 
 
 async def log_search_event(

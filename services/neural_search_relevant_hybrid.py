@@ -93,6 +93,7 @@ def neural_search_relevant_hybrid(
         filters: Dict[str, Any],
         page: int,
         model_id: str,
+        use_semantic: bool = True,
         search_pipeline: str = "eufb-hybrid-v1",
         size_override: Optional[int] = None,
         debug_profile: bool = False,
@@ -109,9 +110,14 @@ def neural_search_relevant_hybrid(
     page_size = int(size_override) if isinstance(size_override, int) and size_override > 0 else PAGE_SIZE
     from_offset = (page - 1) * page_size
 
-    # candidate pools
+    # Candidate pools
     q_len = len((query or "").split())
     k_content = 300 if q_len >= 3 else 200
+    k_title = 100 if q_len >= 3 else 60
+    k_subtitle = 120 if q_len >= 3 else 80
+    k_description = 180 if q_len >= 3 else 120
+    k_keywords = 140 if q_len >= 3 else 90
+    bm25_msm = "70%" if q_len >= 5 else None
 
     # Filters
     filter_conditions = []
@@ -140,6 +146,79 @@ def neural_search_relevant_hybrid(
 
     pagination_depth = max(PAGINATION_DEPTH, from_offset + page_size + 200)
 
+    semantic_neural_dismax = {
+        "dis_max": {
+            "tie_breaker": 0.1,
+            "queries": [
+                {
+                    "neural": {
+                        "title_embedding": {
+                            "query_text": query,
+                            "model_id": model_id,
+                            "k": k_title,
+                            "boost": 1.4
+                        }
+                    }
+                },
+                {
+                    "neural": {
+                        "subtitle_embedding": {
+                            "query_text": query,
+                            "model_id": model_id,
+                            "k": k_subtitle,
+                            "boost": 0.7
+                        }
+                    }
+                },
+                {
+                    "neural": {
+                        "description_embedding": {
+                            "query_text": query,
+                            "model_id": model_id,
+                            "k": k_description,
+                            "boost": 1.1
+                        }
+                    }
+                },
+                {
+                    "neural": {
+                        "keywords_embedding": {
+                            "query_text": query,
+                            "model_id": model_id,
+                            "k": k_keywords,
+                            "boost": 0.4
+                        }
+                    }
+                },
+                {
+                    "neural": {
+                        "content_embedding": {
+                            "query_text": query,
+                            "model_id": model_id,
+                            "k": k_content,
+                            "boost": 1.0
+                        }
+                    }
+                },
+            ]
+        }
+    }
+
+    bm25_clause = {
+        "multi_match": {
+            "query": bm25_text,
+            "fields": [
+                "title.en^10",
+                "subtitle.en^9",
+                "description.en^6",
+                "keywords.en^4"
+            ],
+            "operator": "or",
+            **({"minimum_should_match": bm25_msm} if bm25_msm else {}),
+            "type": "best_fields"
+        }
+    }
+
     search_query = {
         "_source": {
             "includes": [
@@ -164,54 +243,46 @@ def neural_search_relevant_hybrid(
                 }
             }
             if not query
-            else {
-                "hybrid": {
-                    "pagination_depth": pagination_depth,
-                    "queries": [
-                        {
-                            "bool": {
-                                "must": [
-                                    {
-                                        "multi_match": {
-                                            "query": bm25_text,
-                                            "fields": [
-                                                "title.en^10",
-                                                "subtitle.en^9",
-                                                "description.en^6",
-                                                "keywords.en^4",
-                                                "content_chunk.en^2"
-                                            ],
-                                            "operator": "or",
-                                            "minimum_should_match": "70%",
-                                            "type": "best_fields"
-                                        }
-                                    }
-                                ],
-                                "filter": filter_conditions,
-                                "must_not": must_not
+            else (
+                {
+                    "hybrid": {
+                        "pagination_depth": pagination_depth,
+                        "queries": [
+                            {
+                                "bool": {
+                                    "must": [bm25_clause],
+                                    "filter": filter_conditions,
+                                    "must_not": must_not
+                                }
+                            },
+                            {
+                                "bool": {
+                                    "must": [semantic_neural_dismax],
+                                    "filter": filter_conditions,
+                                    "must_not": must_not
+                                }
                             }
-                        },
-                        {
-                            "bool": {
-                                "must": [
-                                    {
-                                        "neural": {
-                                            "content_embedding": {
-                                                "query_text": query,
-                                                "model_id": model_id,
-                                                "k": k_content
-                                            }
-                                        }
-                                    }
-                                ],
-                                "filter": filter_conditions,
-                                "must_not": must_not
-                            }
-                        }
-                    ]
+                        ]
+                    }
                 }
-            }
+                if use_semantic
+                else {
+                    "bool": {
+                        "must": [bm25_clause],
+                        "filter": filter_conditions,
+                        "must_not": must_not
+                    }
+                }
+            )
         ),
+        "collapse": {
+            "field": "parent_id",
+            "inner_hits": {
+                "name": "best_chunks",
+                "size": 3,
+                "_source": ["chunk_index", "content_chunk"]
+            }
+        },
         "aggs": {
             "unique_parents_total": {
                 "cardinality": {
@@ -247,23 +318,12 @@ def neural_search_relevant_hybrid(
     sort_clause = build_sort_hybrid(sort_key, has_query=bool(bm25_text))
     search_query["sort"] = sort_clause
 
-    params = {}
-    if query and search_pipeline:
-        params["search_pipeline"] = search_pipeline
-        params["error_trace"] = "true"
-
-    debug_bundle = {
-        "request_flags": {
-            "debug_profile": bool(debug_profile),
-            "debug_explain": bool(debug_explain),
-        },
-        # store the exact query we sent to OpenSearch (super useful later)
-        "opensearch_request": {
-            "index": index_name,
-            "params": params,
-            "body": search_query,
-        },
-    }
+    def _with_pipeline_params(pipeline_name: Optional[str]) -> Dict[str, str]:
+        p: Dict[str, str] = {}
+        if query and use_semantic and pipeline_name:
+            p["search_pipeline"] = pipeline_name
+            p["error_trace"] = "true"
+        return p
 
     # Fail fast if index missing (copy your existing block, unchanged)
     try:
@@ -293,26 +353,70 @@ def neural_search_relevant_hybrid(
             "opensearch": detail,
         })
 
-    # The crucial bit: pass the search_pipeline param
+    # Execute with graceful fallback:
+    #   configured pipeline -> v1 pipeline -> no pipeline
+    requested_pipeline = search_pipeline if (query and use_semantic and search_pipeline) else None
+    attempts: list[Optional[str]] = []
+    if requested_pipeline:
+        attempts.append(requested_pipeline)
+    if requested_pipeline != "eufb-hybrid-v1":
+        attempts.append("eufb-hybrid-v1")
+    attempts.append(None)
+
+    # Deduplicate while preserving order
+    seen: set[Optional[str]] = set()
+    pipeline_attempts: list[Optional[str]] = []
+    for p in attempts:
+        if p not in seen:
+            seen.add(p)
+            pipeline_attempts.append(p)
+
+    response = None
+    used_pipeline: Optional[str] = None
+    last_error: Optional[TransportError] = None
+
     try:
-        response = client.search(
-            index=index_name,
-            body=search_query,
-            params=params or None,
-        )
+        for attempt_pipeline in pipeline_attempts:
+            params = _with_pipeline_params(attempt_pipeline)
+            try:
+                response = client.search(
+                    index=index_name,
+                    body=search_query,
+                    params=params or None,
+                )
+                used_pipeline = attempt_pipeline
+                break
+            except TransportError as e:
+                last_error = e
+                # If this was the final attempt, re-raise below as HTTPException.
+                logger.warning(
+                    "Hybrid search attempt failed (pipeline=%s): %s",
+                    attempt_pipeline if attempt_pipeline else "none",
+                    e,
+                )
+                continue
+
+        if response is None:
+            if last_error is not None:
+                raise last_error
+            raise HTTPException(status_code=502, detail={
+                "message": "OpenSearch hybrid search failed (no response from fallback attempts)",
+            })
 
         hits = response.get("hits", {}).get("hits", [])
-        logger.info("[HYBRID DEBUG] returned_hits=%d page_size=%d from=%d",
-                    len(hits), page_size, from_offset)
-        # logger.info("[HYBRID DEBUG] sample parent_ids=%s",
-        #             [h.get("_source", {}).get("parent_id") for h in hits[:10]])
-
+        logger.info(
+            "[HYBRID DEBUG] returned_hits=%d page_size=%d from=%d pipeline_used=%s",
+            len(hits),
+            page_size,
+            from_offset,
+            used_pipeline if used_pipeline else "none",
+        )
 
     except TransportError as e:
-        logger.exception("Hybrid search failed: %s", e)
+        logger.exception("Hybrid search failed after fallback attempts: %s", e)
         detail = getattr(e, "info", None) or {"error": str(e)}
         raise HTTPException(status_code=502, detail={
-            "message": "OpenSearch hybrid search failed",
+            "message": "OpenSearch hybrid search failed (all pipeline fallbacks exhausted)",
             "opensearch": detail,
         })
 
@@ -326,8 +430,29 @@ def neural_search_relevant_hybrid(
 
     response["grouped"] = grouped
 
+    # Always add pipeline metadata for observability.
+    response_meta = response.setdefault("_meta", {})
+    response_meta["requested_pipeline"] = requested_pipeline
+    response_meta["used_pipeline"] = used_pipeline
+    response_meta["pipeline_attempts"] = [p if p is not None else "none" for p in pipeline_attempts]
+
     if debug_profile or debug_explain:
+        debug_bundle = {
+            "request_flags": {
+                "debug_profile": bool(debug_profile),
+                "debug_explain": bool(debug_explain),
+            },
+            "opensearch_request": {
+                "index": index_name,
+                "params": _with_pipeline_params(used_pipeline),
+                "body": search_query,
+            },
+            "pipeline_debug": {
+                "requested_pipeline": requested_pipeline,
+                "used_pipeline": used_pipeline,
+                "pipeline_attempts": [p if p is not None else "none" for p in pipeline_attempts],
+            },
+        }
         response["_debug_bundle"] = debug_bundle
 
     return response
-

@@ -6,6 +6,7 @@ import json
 import logging
 import nltk
 import os
+import re
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -392,3 +393,81 @@ def save_debug_dump(*, debug_obj: dict, base_dir: str, index_name: str, user_id:
         json.dump(debug_obj, f, ensure_ascii=False, indent=2)
 
     return str(path.resolve())
+
+
+def _env_int(name: str, default: int, fallback_env: str | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None and fallback_env:
+        raw = os.getenv(fallback_env)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        logger.warning("Invalid int env %s=%r. Using default=%d", name, raw, default)
+        return default
+
+
+def _compile_hint_regex(env_name: str, default_pattern: str, fallback_env: str | None = None) -> re.Pattern:
+    raw = os.getenv(env_name)
+    if raw is None and fallback_env:
+        raw = os.getenv(fallback_env)
+    if raw is None:
+        raw = default_pattern
+    try:
+        return re.compile(raw, re.IGNORECASE)
+    except re.error:
+        logger.warning("Invalid regex env %s=%r. Falling back to default.", env_name, raw)
+        return re.compile(default_pattern, re.IGNORECASE)
+
+
+def infer_query_intent(
+    q: str,
+    *,
+    code_hint_env: str = "QUERY_CODE_HINT_REGEX",
+    code_hint_fallback_env: str | None = None,
+    acronym_min_len_env: str = "QUERY_ACRONYM_MIN_LEN",
+    acronym_min_len_fallback_env: str | None = None,
+    acronym_max_len_env: str = "QUERY_ACRONYM_MAX_LEN",
+    acronym_max_len_fallback_env: str | None = None,
+    acronym_min_caps_env: str = "QUERY_ACRONYM_MIN_CAPS",
+    acronym_min_caps_fallback_env: str | None = None,
+) -> tuple[bool, bool, bool, bool, bool]:
+    """
+    Returns:
+      (use_semantic, looks_like_code_or_id, looks_like_acronym, looks_like_quoted, very_short)
+
+    Env names are parameterized so endpoints can tune intent rules independently.
+    """
+    query = (q or "").strip()
+    q_tokens = query.split()
+
+    code_hint_re = _compile_hint_regex(
+        code_hint_env,
+        r"\d|[_:/]|cve-|doi|isbn",
+        fallback_env=code_hint_fallback_env,
+    )
+    looks_like_code_or_id = bool(code_hint_re.search(query))
+
+    acronym_min_len = _env_int(acronym_min_len_env, 2, fallback_env=acronym_min_len_fallback_env)
+    acronym_max_len = _env_int(acronym_max_len_env, 12, fallback_env=acronym_max_len_fallback_env)
+    acronym_min_caps = _env_int(acronym_min_caps_env, 2, fallback_env=acronym_min_caps_fallback_env)
+
+    if (
+        len(q_tokens) == 1
+        and acronym_min_len <= len(query) <= acronym_max_len
+        and re.fullmatch(r"[A-Za-z]+", query)
+    ):
+        cap_count = sum(1 for ch in query if ch.isupper())
+        looks_like_acronym = cap_count >= acronym_min_caps
+    else:
+        looks_like_acronym = False
+
+    looks_like_quoted = ('"' in query) or ("'" in query)
+    very_short = len(q_tokens) <= 2
+
+    use_semantic = not (looks_like_code_or_id or looks_like_quoted or looks_like_acronym)
+    if very_short and not (looks_like_code_or_id or looks_like_acronym):
+        use_semantic = True
+
+    return use_semantic, looks_like_code_or_id, looks_like_acronym, looks_like_quoted, very_short

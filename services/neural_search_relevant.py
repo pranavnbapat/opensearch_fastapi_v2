@@ -201,13 +201,47 @@ def neural_search_relevant(
             }
         }
 
+        lexical_precision_boosts = [
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": [
+                        "title.en^12",
+                        "subtitle.en^10",
+                        "description.en^7",
+                        "keywords.en^8",
+                    ],
+                    "operator": "and",
+                    "type": "best_fields",
+                    "boost": 1.8,
+                }
+            },
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": [
+                        "title.en^14",
+                        "subtitle.en^12",
+                        "description.en^7",
+                    ],
+                    "type": "phrase",
+                    "boost": 2.2,
+                }
+            },
+        ]
+
         query_part = {
             "bool": {
-                "should": [
+                # Semantic retrieval is the primary gate.
+                # BM25 only boosts ordering for exact lexical evidence.
+                "must": [
                     semantic_dismax,
-                    bm25_multi_match,
                 ],
-                "minimum_should_match": 1
+                "should": [
+                    bm25_multi_match,
+                    *lexical_precision_boosts,
+                    {"term": {"project_acronym": {"value": query, "boost": 6.0}}},
+                ],
             }
         }
     else:
@@ -215,6 +249,7 @@ def neural_search_relevant(
 
         query_part = {
             "bool": {
+                # Lexical-first fallback for acronym/code/exact-term queries.
                 "should": [
                     {
                         "multi_match": {
@@ -227,21 +262,12 @@ def neural_search_relevant(
                                 "keywords.en^4",
                                 "content_chunk.en^2",
                             ],
-                            "operator": "or",
+                            "operator": "and",
                             "type": "best_fields",
                             "boost": 1.0
                         }
                     },
-                    {
-                        "neural": {
-                            "content_embedding": {
-                                "query_text": query,
-                                "model_id": model_id,
-                                "k": k_content,
-                                "boost": 0.3
-                            }
-                        }
-                    }
+                    {"term": {"project_acronym": {"value": filtered_query, "boost": 6.0}}},
                 ],
                 "minimum_should_match": 1
             }

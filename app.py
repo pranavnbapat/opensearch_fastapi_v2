@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 import time
 
 from contextlib import asynccontextmanager
@@ -23,7 +22,7 @@ from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
 from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
-                            fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump)
+                            fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent)
 from tools.debug_llm_summary import build_llm_summary_from_explain_top3
 from tools.llm_explain_client import explain_debug_non_technical
 
@@ -77,15 +76,16 @@ app.add_middleware(
 )
 
 SUMMARY_PROVIDER = (os.getenv("SUMMARY_PROVIDER") or "").lower()
+HYBRID_SEARCH_PIPELINE = os.getenv("HYBRID_SEARCH_PIPELINE", "eufb-hybrid-v1")
+HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lower() in {"1", "true", "yes", "on"})
 
 @app.post("/neural_search_relevant", tags=["Search"],
-          summary="Hybrid semantic search with explicit query control",
+          summary="Semantic-first search with lexical boosting",
           description="""
-          Performs a hybrid semantic search using neural vector similarity across multiple document fields 
-          (title, subtitle, description, keywords, and content) combined with BM25 keyword matching.
-          Semantic relevance is evaluated explicitly in the query layer using field-aware boosting and 
-          disjunction-max scoring, while BM25 acts as a safety net for exact term and phrase matching. 
-          Results are grouped at the parent document level.
+          Performs semantic-first search using neural vector similarity across multiple document fields
+          (title, subtitle, description, keywords, and content), with lexical boosting for exact term and
+          phrase evidence. For code-like or acronym-style queries, the endpoint falls back to a stricter
+          lexical-first mode. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_endpoint(request_temp: Request, request: RelevantSearchRequest):
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
@@ -141,28 +141,13 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         translated = True
     query = translated_query
 
-    # Smart fallback to BM25 if query is short
-    q = query.strip()
-    q_tokens = q.split()
-
-    looks_like_code_or_id = bool(re.search(r"\d|[_:/]|cve-|doi|isbn", q.lower()))
-
-    # Acronym-like: single token, short, mostly letters, with multiple capitals (handles "PCFruit", "EIPAGRI", etc.)
-    if len(q_tokens) == 1 and 2 <= len(q) <= 12 and re.fullmatch(r"[A-Za-z]+", q):
-        cap_count = sum(1 for ch in q if ch.isupper())
-        looks_like_acronym = cap_count >= 2
-    else:
-        looks_like_acronym = False
-
-    looks_like_quoted = ('"' in q) or ("'" in q)
-    very_short = len(q_tokens) <= 2
-
-    # Default: hybrid-style semantic ON, but keep BM25 strong for exact lookups
-    use_semantic = not (looks_like_code_or_id or looks_like_quoted or looks_like_acronym)
-
-    # If it’s *very short* but not an acronym/id, semantic is still useful
-    if very_short and not (looks_like_code_or_id or looks_like_acronym):
-        use_semantic = True
+    use_semantic, _, _, _, _ = infer_query_intent(
+        query,
+        code_hint_env="QUERY_CODE_HINT_REGEX",
+        acronym_min_len_env="QUERY_ACRONYM_MIN_LEN",
+        acronym_max_len_env="QUERY_ACRONYM_MAX_LEN",
+        acronym_min_caps_env="QUERY_ACRONYM_MIN_CAPS",
+    )
 
     model_key = request.model.lower().strip() if request.model else "msmarco"
     model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
@@ -297,6 +282,19 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         translated = True
     query = translated_query
 
+    # Query-intent routing (same as /neural_search_relevant, configurable via env)
+    use_semantic_hybrid, _, _, _, _ = infer_query_intent(
+        query,
+        code_hint_env="HYBRID_QUERY_CODE_HINT_REGEX",
+        code_hint_fallback_env="QUERY_CODE_HINT_REGEX",
+        acronym_min_len_env="HYBRID_QUERY_ACRONYM_MIN_LEN",
+        acronym_min_len_fallback_env="QUERY_ACRONYM_MIN_LEN",
+        acronym_max_len_env="HYBRID_QUERY_ACRONYM_MAX_LEN",
+        acronym_max_len_fallback_env="QUERY_ACRONYM_MAX_LEN",
+        acronym_min_caps_env="HYBRID_QUERY_ACRONYM_MIN_CAPS",
+        acronym_min_caps_fallback_env="QUERY_ACRONYM_MIN_CAPS",
+    )
+
     filters = {
         "topics": request.topics,
         "themes": request.themes,
@@ -332,7 +330,8 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         filters=filters,
         page=page_number,
         model_id=model_id,
-        search_pipeline="eufb-hybrid-v1",
+        use_semantic=use_semantic_hybrid,
+        search_pipeline=(HYBRID_SEARCH_PIPELINE if HYBRID_ENABLE_PIPELINE else None),
         size_override=None,
         debug_profile=debug_profile,
         debug_explain=debug_explain,
@@ -351,8 +350,15 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         summarise_top5_hf_fn=summarise_top5_hf,
     )
 
-    logger.info("[HYBRID] Search Query: '%s', Index: %s, Page: %d, Pipeline: %s",
-                query, index_name, page_number, "eufb-hybrid-v1")
+    logger.info(
+        "[HYBRID] Search Query: '%s', Semantic: %s, Index: %s, Page: %d, Pipeline enabled: %s, Requested pipeline: %s",
+        query,
+        use_semantic_hybrid,
+        index_name,
+        page_number,
+        HYBRID_ENABLE_PIPELINE,
+        HYBRID_SEARCH_PIPELINE,
+    )
 
     if debug_enabled:
         debug_obj = response_json.setdefault("_debug", {})
@@ -447,7 +453,7 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         user_id=user_id,
         model_key=model_key,
         index_name=index_name,
-        use_semantic=True,  # Hybrid always uses semantic
+        use_semantic=use_semantic_hybrid,
         filters=filters,
         response_json=response_json,
         request_k=(request.k if (getattr(request, "k", None) is not None) else None),
