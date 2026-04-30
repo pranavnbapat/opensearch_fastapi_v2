@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 
 from services.clickhouse_logger import make_default_clickhouse_logger
-from services.neural_search_relevant import neural_search_relevant, RelevantSearchRequest
+from services.neural_search_relevant import neural_search_relevant, RelevantSearchRequest, build_default_query_profile
 from services.neural_search_relevant_advanced import (
     neural_search_relevant as neural_search_relevant_advanced,
     RelevantSearchRequest as RelevantSearchRequestAdvanced,
@@ -151,13 +151,8 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         translated = True
     query = translated_query
 
-    use_semantic, _, _, _, _ = infer_query_intent(
-        query,
-        code_hint_env="QUERY_CODE_HINT_REGEX",
-        acronym_min_len_env="QUERY_ACRONYM_MIN_LEN",
-        acronym_max_len_env="QUERY_ACRONYM_MAX_LEN",
-        acronym_min_caps_env="QUERY_ACRONYM_MIN_CAPS",
-    )
+    query_profile = build_default_query_profile(query)
+    use_semantic = bool(query_profile.get("use_semantic", True))
 
     model_key = request.model.lower().strip() if request.model else "msmarco"
     model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
@@ -181,6 +176,7 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         size_override=None,
         debug_profile=bool(getattr(request, "debug_profile", False)),
         debug_explain=bool(getattr(request, "debug_explain", False)),
+        query_profile=query_profile,
     )
 
     include_fulltext = bool(getattr(request, "include_fulltext", False))
@@ -196,8 +192,8 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         summarise_top5_hf_fn=summarise_top5_hf,
     )
 
-    logger.info("Search Query: '%s', Semantic: %s, Index: %s, Page: %d",
-                query, use_semantic, index_name, page_number)
+    logger.info("Search Query: '%s', Semantic: %s, Mode: %s, Index: %s, Page: %d",
+                query, use_semantic, query_profile.get("query_mode"), index_name, page_number)
 
     if bool(getattr(request, "debug_explain", False)):
         raw_hits = (response or {}).get("hits", {}).get("hits", [])
