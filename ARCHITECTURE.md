@@ -2,7 +2,7 @@
 
 ## System Overview
 
-The EU FarmBook OpenSearch API is a Python-based FastAPI application that provides intelligent search and recommendation capabilities over an OpenSearch cluster. The system is designed for high-performance semantic search, combining traditional keyword matching with modern neural embedding techniques.
+The EU FarmBook OpenSearch API is a Python-based FastAPI application that provides search and recommendation capabilities over an OpenSearch cluster. The current primary retrieval strategy is semantic-first search with lexical boosting, alongside experimental hybrid, sparse, and advanced boolean-aware search paths.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -67,43 +67,58 @@ The main FastAPI application that defines all HTTP endpoints and orchestrates re
 - Response formatting and post-processing (summarization, pagination)
 
 **Key Endpoints:**
-- `/neural_search_relevant` - Primary semantic search with dis_max scoring
-- `/neural_search_relevant_hybrid` - Hybrid search with pipeline-based normalization
-- `/neural_search_relevant_sparse` - Learned sparse retrieval (neural_sparse)
-- `/neural_search_relevant_new` - Experimental search with chunk reranking
+- `/neural_search_relevant` - Default semantic-first search with lexical boosting
+- `/neural_search_relevant_advanced` - Experimental boolean-aware search with explicit operators and field scoping
+- `/neural_search_relevant_hybrid` - Experimental OpenSearch hybrid search with optional pipeline normalization
+- `/neural_search_relevant_sparse` - Learned sparse retrieval (`neural_sparse`)
+- `/neural_search_relevant_new` - Experimental fragment-aware search path
 - `/recommend_similar_knn` - k-NN content-based recommendations
 
 ### 2. Service Layer
 
 #### 2.1 Neural Search (`neural_search_relevant.py`)
 
-Implements the core semantic search algorithm using OpenSearch's neural query DSL.
+Implements the current default semantic-first search algorithm using OpenSearch's neural query DSL.
 
 **Key Features:**
 - **Multi-field Embedding Search** - Queries across 5 embedding fields (title, subtitle, description, keywords, content) with field-specific boosts
 - **Dynamic k-values** - Adjusts candidate pool sizes based on query length
 - **Disjunction Max (dis_max)** - Allows the strongest field match to dominate scoring
-- **BM25 Safety Net** - Combines neural results with keyword matching for robustness
+- **Lexical Ranking Boosts** - Uses lexical signals to improve ordering without making them broad eligibility gates in semantic mode
 - **Smart Semantic Toggle** - Disables semantic search for IDs, codes, acronyms, and quoted phrases
 
 **Query Flow:**
 ```
-User Query → Query Analysis → (Optional: Translation) → 
-Build Neural Clauses (dis_max) → Add BM25 Component → 
-Apply Filters → Collapse by parent_id → Return Results
+User Query → Query Analysis → (Optional: Translation) →
+Choose Semantic-first or Lexical-first Path →
+Build Retrieval Clauses → Apply Filters →
+Collapse by parent_id → Return Results
 ```
 
 #### 2.2 Hybrid Search (`neural_search_relevant_hybrid.py`)
 
-Uses OpenSearch's native hybrid query with search pipelines for score normalization.
+Uses OpenSearch's native hybrid query with optional search-pipeline-based score normalization.
 
 **Key Features:**
 - **Native Hybrid DSL** - Uses OpenSearch's `hybrid` query type
-- **Search Pipeline Integration** - Applies `eufb-hybrid-v1` pipeline for score normalization
+- **Search Pipeline Integration** - Uses the configured hybrid pipeline when enabled
 - **BM25 + Neural** - Combines multi_match text queries with neural embedding queries
 - **Pagination Depth Control** - Configurable depth for accurate result collapsing
 
-#### 2.3 Sparse Neural Search (`neural_search_relevant_sparse.py`)
+This endpoint is currently considered experimental relative to the tuned default semantic-first endpoint.
+
+#### 2.3 Advanced Search (`neural_search_relevant_advanced.py`)
+
+Implements an isolated experimental search path for boolean-aware and field-scoped retrieval.
+
+**Key Features:**
+- **Explicit Boolean Parsing** - Supports uppercase `AND`, `OR`, `NOT`, and parentheses
+- **Field-scoped Clauses** - Supports syntax like `title:"soil health"` and `keywords:"crop rotation"`
+- **Project Scoping** - Supports `-project`, `--project`, `project:`, and `acronym:`
+- **Mode Controls** - Supports `mode:strict|broad|semantic|lexical`
+- **Fallback Switch** - With `advanced=false`, behaves like `/neural_search_relevant`
+
+#### 2.4 Sparse Neural Search (`neural_search_relevant_sparse.py`)
 
 Implements learned sparse retrieval using OpenSearch's `neural_sparse` query.
 
@@ -112,7 +127,7 @@ Implements learned sparse retrieval using OpenSearch's `neural_sparse` query.
 - **Analyzer-based Querying** - Query-time token expansion using BERT-compatible analyzers
 - **Rank Features Scoring** - Efficient sparse dot-product scoring
 
-#### 2.4 k-NN Recommender (`recommender_knn.py`)
+#### 2.5 k-NN Recommender (`recommender_knn.py`)
 
 Content-based recommendation engine using vector similarity.
 
@@ -127,7 +142,7 @@ Content-based recommendation engine using vector similarity.
 - `exact` - Full index scan with precise cosine similarity
 - `ann` - Approximate nearest neighbors for large-scale retrieval
 
-#### 2.5 Language Detection & Translation (`language_detect.py`)
+#### 2.6 Language Detection & Translation (`language_detect.py`)
 
 Multi-provider translation service with fallback capabilities.
 
@@ -137,7 +152,7 @@ Multi-provider translation service with fallback capabilities.
 - **Google Fallback** - Google Cloud Translation as secondary provider
 - **Exponential Backoff** - Retry logic for resilient API calls
 
-#### 2.6 Summarization (`summariser_hf.py`)
+#### 2.7 Summarization (`summariser_hf.py`)
 
 LLM-powered result summarization using Hugging Face inference API.
 
@@ -147,7 +162,7 @@ LLM-powered result summarization using Hugging Face inference API.
 - **Structured Prompts** - Enforces factual, non-meta commentary in summaries
 - **Configurable Timeouts** - Adjustable connection and read timeouts
 
-#### 2.7 Utilities (`utils.py`)
+#### 2.8 Utilities (`utils.py`)
 
 Shared infrastructure and helper functions.
 
@@ -188,7 +203,14 @@ LLM inference for result summarization:
 - Supports configurable model selection
 - Implements concurrency controls and timeouts
 
-#### 3.4 DeepL
+#### 3.4 LLM Debug Explanation
+
+Optional LLM-backed explanation for `debug_explain=true`:
+
+- attempts a human-readable explanation when LLM config is available
+- falls back silently to structured debug output if unavailable
+
+#### 3.5 DeepL
 
 Machine translation for multilingual search:
 - Automatic query translation to English
@@ -256,7 +278,15 @@ if access_token_valid and detected_lang != "en":
 - Build dis_max query across 5 embedding fields
 - Field-specific boosts: title (1.4), description (1.1), content (1.0), subtitle (0.7), keywords (0.4)
 - Dynamic k-values based on query length
-- Add BM25 multi_match as secondary clause
+- Add lexical boosts as secondary ranking clauses
+
+**Lexical Fallback Branch:**
+- Used for code-like, acronym-like, and exact-term-style queries
+- Uses stricter lexical matching with project acronym boosts
+
+**Advanced Branch:**
+- Optional experimental parser for boolean-aware and field-scoped queries
+- Can force semantic-only or lexical-only positive clause handling via `mode:`
 
 **BM25 Branch:**
 - Multi-match across text fields with English analyzer

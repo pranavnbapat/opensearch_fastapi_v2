@@ -31,3 +31,4 @@ models/
 models_cache/
 cron/
 temp/
+feedback/
