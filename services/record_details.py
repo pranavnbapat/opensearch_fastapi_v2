@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional, Literal
 
 from fastapi import HTTPException
 from opensearchpy.exceptions import ConnectionTimeout, ConnectionError, TransportError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from services.search_endpoint_helpers import format_parent_result_item
 from services.utils import client, fetch_chunks_for_parents
@@ -21,6 +21,14 @@ class RecordDetailsRequest(BaseModel):
 
     class Config:
         allow_population_by_field_name = True
+
+    @model_validator(mode="after")
+    def validate_exactly_one_identifier(self):
+        has_record_id = bool((self.record_id or "").strip())
+        has_at_id = bool((self.at_id or "").strip())
+        if has_record_id == has_at_id:
+            raise ValueError("Provide exactly one of: _id or @id")
+        return self
 
 
 SOURCE_INCLUDES = [
@@ -138,3 +146,20 @@ def get_record_details(index_name: str, request: RecordDetailsRequest) -> Dict[s
             **lookup_meta,
         },
     }
+
+
+def get_record_details_by_identifier(
+    *,
+    index_name: str,
+    record_id: Optional[str] = None,
+    at_id: Optional[str] = None,
+    include_fulltext: bool = True,
+) -> Dict[str, Any]:
+    request = RecordDetailsRequest(
+        **{
+            "_id": record_id,
+            "@id": at_id,
+            "include_fulltext": True if include_fulltext else True,
+        }
+    )
+    return get_record_details(index_name=index_name, request=request)

@@ -24,6 +24,7 @@ from services.neural_search_relevant_sparse import neural_search_relevant_sparse
 from services.neural_search_relevant_new import (neural_search_relevant_new, split_query_into_fragments,
                                                  RelevantSearchRequestNew, score_chunk_for_fragments, )
 from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
+from services.mongo_ko_metadata_sync import sync_ko_metadata_from_opensearch, MongoKOMetadataSyncRequest
 from services.record_details import get_record_details, RecordDetailsRequest
 from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
 from services.summariser_hf import summarise_top5_hf
@@ -803,6 +804,47 @@ async def record_details_endpoint(request: RecordDetailsRequest):
                 index_name,
                 ((response.get("_meta") or {}).get("match_field")),
                 ((response.get("_meta") or {}).get("found")))
+
+    return response
+
+
+@app.post("/sync_ko_metadata_from_record_details", tags=["Details"],
+          summary="Sync KO metadata fields from OpenSearch into MongoDB",
+          response_description="Dry-run or update summary for MongoDB ko_metadata synchronization.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              500: {"description": "MongoDB configuration or runtime error."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
+          description="""
+          Iterates MongoDB `logical_layer.ko_metadata`, looks up each KO in OpenSearch via `@id`,
+          and syncs the following fields into MongoDB: `title`, `title_original`, `subtitle`,
+          `subtitle_original`, `keywords`, `keywords_original`, `description`, `description_original`,
+          and `ko_content_flat_summarised`. Default mode is `DEV`. Default execution is dry-run.
+          Missing lookups are skipped; the process continues.
+          """)
+async def sync_ko_metadata_from_record_details_endpoint(request: MongoKOMetadataSyncRequest):
+    model_key = request.model.lower().strip() if request.model else "msmarco"
+    model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
+    index_name = model_config["index"]
+
+    if request.mode.upper() == "DEV":
+        index_name += "_dev"
+
+    response = sync_ko_metadata_from_opensearch(
+        request=request,
+        index_name=index_name,
+    )
+
+    logger.info("[SYNC KO METADATA] mode=%s dry_run=%s scanned=%s matched=%s updated=%s skipped_missing_lookup=%s errors=%s",
+                request.mode,
+                request.dry_run,
+                response.get("scanned"),
+                response.get("matched"),
+                response.get("updated"),
+                response.get("skipped_missing_lookup"),
+                response.get("errors"))
 
     return response
 
