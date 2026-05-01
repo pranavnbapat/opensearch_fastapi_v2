@@ -91,6 +91,16 @@ QUESTION_NOISE_PREFIXES = [
     "i'm wondering if", "i am wondering if", "can you explain", "can you check if", "does anyone know if",
     "so like", "um", "after the last treatment", "what about",
 ]
+FULL_SENTENCE_LEADERS = [
+    "we are trying to", "we are considering", "we are seeing", "we applied", "we used", "we noticed",
+    "i used to", "i noticed", "i am looking for", "i'm looking for", "after the recent", "after the last",
+    "based on", "looking for", "find", "the soil", "the new", "the application", "this study", "this project",
+]
+QUESTION_GENERIC_TOKENS = {
+    "what", "what's", "which", "when", "where", "why", "how", "can", "could", "should", "would",
+    "best", "recommended", "recommend", "explain", "difference", "signs", "mean", "means", "use",
+    "using", "help", "helps", "still", "apply", "applied", "time", "way", "there", "any",
+}
 
 
 def _normalize_query_spaces(query: str) -> str:
@@ -101,6 +111,9 @@ def _strip_leading_noise(query: str) -> str:
     cleaned = _normalize_query_spaces(query)
     lowered = cleaned.lower()
     for prefix in QUESTION_NOISE_PREFIXES:
+        if lowered.startswith(prefix + " "):
+            return cleaned[len(prefix):].strip(" ,.:;!?-")
+    for prefix in FULL_SENTENCE_LEADERS:
         if lowered.startswith(prefix + " "):
             return cleaned[len(prefix):].strip(" ,.:;!?-")
     return cleaned
@@ -121,6 +134,100 @@ def _rewrite_query_for_retrieval(query: str) -> str:
     chosen = filtered_tokens[:10] if filtered_tokens else original_tokens[:10]
     rewritten = " ".join(chosen).strip()
     return rewritten or _normalize_query_spaces(query)
+
+
+def _rewrite_question_focus_query(query: str) -> str:
+    cleaned = _strip_leading_noise(query)
+    cleaned = NON_WORD_RE.sub(" ", cleaned)
+    cleaned = _normalize_query_spaces(cleaned)
+
+    filtered = remove_stopwords_from_query(cleaned)
+    filtered = _normalize_query_spaces(filtered)
+    tokens = [tok for tok in filtered.split() if tok.lower() not in QUESTION_GENERIC_TOKENS]
+
+    if len(tokens) >= 3:
+        return " ".join(tokens[:10])
+    return filtered or cleaned
+
+
+def _build_attempts_for_profile(
+    *,
+    normalized_query: str,
+    rewritten_query: str,
+    use_semantic: bool,
+    query_mode: str,
+) -> List[Dict[str, Any]]:
+    attempts: List[Dict[str, Any]] = []
+    question_focus_query = _rewrite_question_focus_query(normalized_query) if query_mode == "question" else ""
+
+    primary_query = rewritten_query if (not use_semantic and rewritten_query) else normalized_query
+    attempts.append(
+        {
+            "label": "primary",
+            "query_text": primary_query,
+            "use_semantic": use_semantic,
+        }
+    )
+
+    if query_mode in {"question", "long_descriptive"}:
+        if query_mode == "question" and question_focus_query and question_focus_query.lower() != primary_query.lower():
+            attempts.insert(
+                0,
+                {
+                    "label": "question_focus_lexical",
+                    "query_text": question_focus_query,
+                    "use_semantic": False,
+                }
+            )
+            attempts.append(
+                {
+                    "label": "question_focus_semantic",
+                    "query_text": question_focus_query,
+                    "use_semantic": True,
+                }
+            )
+        if rewritten_query and rewritten_query.lower() != primary_query.lower():
+            attempts.append(
+                {
+                    "label": "rewrite_semantic",
+                    "query_text": rewritten_query,
+                    "use_semantic": True,
+                }
+            )
+        if normalized_query and normalized_query.lower() != primary_query.lower():
+            attempts.append(
+                {
+                    "label": "original_lexical",
+                    "query_text": normalized_query,
+                    "use_semantic": False,
+                }
+            )
+        attempts.append(
+            {
+                "label": "original_semantic",
+                "query_text": normalized_query,
+                "use_semantic": True,
+            }
+        )
+    else:
+        if rewritten_query and rewritten_query.lower() != primary_query.lower():
+            attempts.append(
+                {
+                    "label": "rewrite_lexical",
+                    "query_text": rewritten_query,
+                    "use_semantic": False,
+                }
+            )
+        if normalized_query and normalized_query.lower() != primary_query.lower():
+            attempts.append(
+                {
+                    "label": "original_semantic",
+                    "query_text": normalized_query,
+                    "use_semantic": True,
+                }
+            )
+
+    return attempts
 
 
 def build_default_query_profile(query: str) -> Dict[str, Any]:
@@ -175,31 +282,12 @@ def build_default_query_profile(query: str) -> Dict[str, Any]:
         use_semantic = base_use_semantic
         reason = "short_broad_topic_query"
 
-    attempts: List[Dict[str, Any]] = []
-    primary_query = rewritten_query if (not use_semantic and rewritten_query) else normalized_query
-    attempts.append(
-        {
-            "label": "primary",
-            "query_text": primary_query,
-            "use_semantic": use_semantic,
-        }
+    attempts = _build_attempts_for_profile(
+        normalized_query=normalized_query,
+        rewritten_query=rewritten_query,
+        use_semantic=use_semantic,
+        query_mode=query_mode,
     )
-    if rewritten_query and rewritten_query.lower() != primary_query.lower():
-        attempts.append(
-            {
-                "label": "rewrite_lexical",
-                "query_text": rewritten_query,
-                "use_semantic": False,
-            }
-        )
-    if normalized_query and normalized_query.lower() != primary_query.lower():
-        attempts.append(
-            {
-                "label": "original_semantic",
-                "query_text": normalized_query,
-                "use_semantic": True,
-            }
-        )
 
     deduped_attempts: List[Dict[str, Any]] = []
     seen_attempts = set()
@@ -273,6 +361,22 @@ def _build_query_part(query_text: str, model_id: str, use_semantic: bool, profil
             "boost": 1.0,
         }
     }
+    lexical_cross_fields_query = {
+        "multi_match": {
+            "query": query_text,
+            "fields": [
+                "title.en^10",
+                "subtitle.en^9",
+                "description.en^7",
+                "keywords.en^6",
+                "content_chunk.en^3",
+            ],
+            "type": "cross_fields",
+            "operator": "or",
+            "minimum_should_match": "60%",
+            "boost": 1.4,
+        }
+    }
     lexical_phrase_query = {
         "multi_match": {
             "query": query_text,
@@ -319,6 +423,7 @@ def _build_query_part(query_text: str, model_id: str, use_semantic: bool, profil
         project_acronym_boost,
     ]
     if profile.get("query_mode") in {"question", "long_descriptive", "unit_or_constraint"}:
+        lexical_should.insert(0, lexical_cross_fields_query)
         lexical_should.append(
             {
                 "match_phrase_prefix": {
@@ -326,6 +431,24 @@ def _build_query_part(query_text: str, model_id: str, use_semantic: bool, profil
                         "query": query_text,
                         "boost": 1.6,
                     }
+                }
+            }
+        )
+    if profile.get("query_mode") == "question":
+        lexical_should.append(
+            {
+                "multi_match": {
+                    "query": query_text,
+                    "fields": [
+                        "title.en^11",
+                        "subtitle.en^10",
+                        "description.en^8",
+                        "keywords.en^7",
+                    ],
+                    "type": "best_fields",
+                    "operator": "or",
+                    "minimum_should_match": "50%",
+                    "boost": 1.8,
                 }
             }
         )

@@ -24,6 +24,7 @@ from services.neural_search_relevant_sparse import neural_search_relevant_sparse
 from services.neural_search_relevant_new import (neural_search_relevant_new, split_query_into_fragments,
                                                  RelevantSearchRequestNew, score_chunk_for_fragments, )
 from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
+from services.record_details import get_record_details, RecordDetailsRequest
 from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
@@ -774,6 +775,36 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
     )
 
     return response_json
+
+
+@app.post("/record_details", tags=["Details"],
+          summary="Fetch a single knowledge object by identifier",
+          response_description="A single KO record with metadata and optional full text.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
+          description="""
+          Fetches one knowledge object by `_id` (parent KO id) or `@id`. The lookup is performed
+          against KO meta documents only, so the response contains one parent record rather than search chunks.
+          """)
+async def record_details_endpoint(request: RecordDetailsRequest):
+    model_key = request.model.lower().strip() if request.model else "msmarco"
+    model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
+    index_name = model_config["index"]
+
+    if request.dev:
+        index_name += "_dev"
+
+    response = get_record_details(index_name=index_name, request=request)
+
+    logger.info("[RECORD DETAILS] index=%s match_field=%s found=%s",
+                index_name,
+                ((response.get("_meta") or {}).get("match_field")),
+                ((response.get("_meta") or {}).get("found")))
+
+    return response
 
 
 @app.post("/recommend_similar_knn", tags=["Recommend"],

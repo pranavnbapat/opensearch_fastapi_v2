@@ -60,6 +60,70 @@ async def resolve_auth_context(access_token: Optional[str], dev: bool, include_s
     return translation_allowed, include_summary, user_id
 
 
+def _format_date_created(doc_date: Any) -> Optional[str]:
+    if isinstance(doc_date, str) and len(doc_date) >= 10:
+        try:
+            y, m, d = doc_date[:10].split("-")
+            return f"{d}-{m}-{y}"
+        except Exception:
+            return doc_date
+    return None
+
+
+def format_parent_result_item(
+    p: Dict[str, Any],
+    *,
+    fulltext_pages: Optional[list[str]] = None,
+    fulltext_chunks: Optional[list[Dict[str, Any]]] = None,
+    include_fulltext: bool = False,
+) -> Dict[str, Any]:
+    item = {
+        "_id": p.get("parent_id"),
+        "_score": p.get("max_score"),
+        "title": p.get("title"),
+        "title_original": p.get("title_original"),
+        "subtitle": p.get("subtitle") or "",
+        "subtitle_original": p.get("subtitle_original"),
+        "description": p.get("description"),
+        "description_original": p.get("description_original"),
+        "keywords": p.get("keywords") or [],
+        "keywords_original": p.get("keywords_original") or [],
+        "projectAcronym": p.get("project_acronym"),
+        "projectName": p.get("project_name"),
+        "projectDisplayName": p.get("project_display_name"),
+        "project_type": p.get("project_type"),
+        "project_id": p.get("project_id"),
+        "projectUrl": p.get("project_url"),
+        "topics": p.get("topics") or [],
+        "themes": p.get("themes") or [],
+        "languages": p.get("languages") or [],
+        "locations": p.get("locations") or [],
+        "category": p.get("category"),
+        "subcategories": p.get("subcategories") or [],
+        "creators": p.get("creators") or [],
+        "intended_purposes": p.get("intended_purposes") or [],
+        "dateCreated": _format_date_created(p.get("date_of_completion")),
+        "date_of_completion": p.get("date_of_completion"),
+        "@id": p.get("@id"),
+        "_orig_id": p.get("_orig_id"),
+        "ko_id": p.get("ko_id"),
+        "ko_created_at": p.get("ko_created_at"),
+        "ko_updated_at": p.get("ko_updated_at"),
+        "proj_created_at": p.get("proj_created_at"),
+        "proj_updated_at": p.get("proj_updated_at"),
+        "_tags": p.get("keywords") or [],
+    }
+
+    if include_fulltext:
+        item["ko_content_flat"] = fulltext_pages or []
+        item["fulltext_chunks"] = fulltext_chunks or []
+
+    if p.get("ko_content_flat_summarised") is not None:
+        item["ko_content_flat_summarised"] = p.get("ko_content_flat_summarised")
+
+    return item
+
+
 async def build_response_json(
     response: Dict[str, Any],
     index_name: str,
@@ -83,56 +147,15 @@ async def build_response_json(
     formatted_results = []
     for p in parents:
         pid = p.get("parent_id")
+        raw_chunks = chunks_map.get(pid, []) if include_fulltext else []
+        fulltext_pages = [c.get("content", "") for c in raw_chunks if c.get("content")] if include_fulltext else None
 
-        ko_chunks = [c["content"] for c in chunks_map.get(pid, [])] if include_fulltext else None
-
-        doc_date = p.get("date_of_completion")
-        if isinstance(doc_date, str) and len(doc_date) >= 10:
-            try:
-                y, m, d = doc_date[:10].split("-")
-                date_created = f"{d}-{m}-{y}"
-            except Exception:
-                date_created = doc_date
-        else:
-            date_created = None
-
-        item = {
-            "_id": pid,
-            "_score": p.get("max_score"),
-
-            "title": p.get("title"),
-            "title_original": p.get("title_original"),
-
-            "subtitle": p.get("subtitle") or "",
-            "subtitle_original": p.get("subtitle_original"),
-
-            "description": p.get("description"),
-            "description_original": p.get("description_original"),
-
-            "keywords": p.get("keywords") or [],
-            "keywords_original": p.get("keywords_original") or [],
-
-            "projectAcronym": p.get("project_acronym"),
-            "projectName": p.get("project_name"),
-            "project_type": p.get("project_type"),
-            "project_id": p.get("project_id"),
-            "topics": p.get("topics") or [],
-            "themes": p.get("themes") or [],
-
-            "languages": p.get("languages") or [],
-            "locations": p.get("locations") or [],
-            "category": p.get("category"),
-            "subcategories": p.get("subcategories") or [],
-            "creators": p.get("creators") or [],
-            "dateCreated": date_created,
-            "@id": p.get("@id"),
-            "_orig_id": p.get("_orig_id"),
-            "_tags": p.get("keywords") or [],
-        }
-
-        if include_fulltext:
-            item["ko_content_flat"] = ko_chunks or []
-
+        item = format_parent_result_item(
+            p,
+            fulltext_pages=fulltext_pages,
+            fulltext_chunks=raw_chunks if include_fulltext else None,
+            include_fulltext=include_fulltext,
+        )
         formatted_results.append(item)
 
     total_pages = (int(total_parents) + PAGE_SIZE - 1) // PAGE_SIZE
