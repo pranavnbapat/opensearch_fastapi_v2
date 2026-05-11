@@ -220,6 +220,43 @@ def fetch_chunks_for_parents(index_name: str, parent_ids: list[str]) -> dict[str
 
     return by_parent
 
+
+def fetch_meta_fields_for_parents(
+    index_name: str,
+    parent_ids: list[str],
+    fields: list[str],
+) -> dict[str, dict]:
+    """
+    Return selected fields from meta docs (chunk_index == -1) for each parent_id.
+    Shape: {parent_id: {field: value, ...}}
+    """
+    if not parent_ids or not fields:
+        return {}
+
+    body = {
+        "_source": ["parent_id"] + fields,
+        "size": max(len(parent_ids), 1),
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"parent_id": parent_ids}},
+                    {"term": {"chunk_index": -1}},
+                ]
+            }
+        },
+    }
+    resp = client.search(index=index_name, body=body)
+
+    by_parent: dict[str, dict] = {}
+    for h in resp["hits"]["hits"]:
+        src = h.get("_source") or {}
+        pid = src.get("parent_id")
+        if not pid:
+            continue
+        by_parent[pid] = {field: src.get(field) for field in fields}
+
+    return by_parent
+
 def build_sort(sort_by: str, has_query: bool):
     """
     Returns an OpenSearch sort clause for the top-level request.

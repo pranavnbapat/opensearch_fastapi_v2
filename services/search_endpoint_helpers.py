@@ -3,11 +3,11 @@
 import logging
 import time
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.clickhouse_logger import build_search_event
 from services.language_detect import detect_language, translate_text_with_backoff, DEEPL_SUPPORTED_LANGUAGES
-from services.utils import is_translation_allowed, jwt_claim, PAGE_SIZE, fetch_chunks_for_parents
+from services.utils import is_translation_allowed, jwt_claim, PAGE_SIZE, fetch_chunks_for_parents, fetch_meta_fields_for_parents
 
 
 logger = logging.getLogger(__name__)
@@ -143,12 +143,21 @@ async def build_response_json(
 
     parent_ids = [p.get("parent_id") for p in parents if p.get("parent_id")]
     chunks_map = fetch_chunks_for_parents(index_name, parent_ids) if (include_fulltext and parent_ids) else {}
+    meta_map = fetch_meta_fields_for_parents(
+        index_name,
+        parent_ids,
+        ["ko_content_flat_summarised"],
+    ) if parent_ids else {}
 
     formatted_results = []
     for p in parents:
         pid = p.get("parent_id")
         raw_chunks = chunks_map.get(pid, []) if include_fulltext else []
         fulltext_pages = [c.get("content", "") for c in raw_chunks if c.get("content")] if include_fulltext else None
+        meta_fields = meta_map.get(pid) or {}
+        if meta_fields.get("ko_content_flat_summarised") is not None:
+            p = dict(p)
+            p["ko_content_flat_summarised"] = meta_fields.get("ko_content_flat_summarised")
 
         item = format_parent_result_item(
             p,
@@ -203,6 +212,201 @@ async def build_response_json(
     meta = response.get("_meta")
     if isinstance(meta, dict) and meta:
         response_json["_meta"] = meta
+
+    return response_json
+
+
+def _compact_project_display(src: Dict[str, Any]) -> Optional[str]:
+    project_name = src.get("project_name") or src.get("projectName") or src.get("project_display_name")
+    acronym = src.get("project_acronym") or src.get("projectAcronym")
+    project_type = src.get("project_type")
+
+    cap = (project_name or acronym or "").strip()
+    if not cap:
+        return None
+    if project_type:
+        return f"{cap} ({project_type})"
+    return cap
+
+
+def _build_llm_context(src: Dict[str, Any]) -> str:
+    parts: List[str] = []
+
+    title = (src.get("title") or "").strip()
+    subtitle = (src.get("subtitle") or "").strip()
+    description = (src.get("description") or "").strip()
+    content = (src.get("content_chunk") or src.get("content") or "").strip()
+    summarised_pages = src.get("ko_content_flat_summarised") or []
+    summarised_text = ""
+    if isinstance(summarised_pages, list):
+        summarised_text = " ".join(str(x) for x in summarised_pages if str(x).strip()).strip()
+    elif isinstance(summarised_pages, str):
+        summarised_text = summarised_pages.strip()
+
+    # Prefer chunk evidence, but fall back to summarised document text if the chunk
+    # is too short to ground an answer usefully.
+    evidence_text = content
+    if len(evidence_text) < 140 and summarised_text:
+        evidence_text = summarised_text[:1200]
+    project_display = _compact_project_display(src)
+    keywords = src.get("keywords") or []
+    topics = src.get("topics") or []
+
+    if title:
+        parts.append(f"Title: {title}")
+    if subtitle:
+        parts.append(f"Subtitle: {subtitle}")
+    if project_display:
+        parts.append(f"Project: {project_display}")
+    if description:
+        parts.append(f"Description: {description[:500]}")
+    if keywords:
+        parts.append("Keywords: " + ", ".join(map(str, keywords[:8])))
+    if topics:
+        parts.append("Topics: " + ", ".join(map(str, topics[:6])))
+    if evidence_text:
+        parts.append(f"Evidence: {evidence_text[:1200]}")
+
+    return "\n".join(parts).strip()
+
+
+def _format_llm_result_item_from_chunk(
+    parent_hit: Dict[str, Any],
+    chunk_hit: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    parent_src = (parent_hit or {}).get("_source") or {}
+    chunk_src = (chunk_hit or {}).get("_source") or {}
+
+    parent_id = parent_src.get("parent_id") or parent_src.get("_orig_id")
+    chunk_text = (chunk_src.get("content_chunk") or parent_src.get("content_chunk") or "").strip()
+    chunk_index = chunk_src.get("chunk_index", parent_src.get("chunk_index"))
+
+    if not parent_id or not chunk_text:
+        return None
+
+    merged_src = dict(parent_src)
+    merged_src["content_chunk"] = chunk_text
+    merged_src["chunk_index"] = chunk_index
+    project_display = _compact_project_display(parent_src)
+
+    return {
+        "_id": chunk_hit.get("_id") or parent_hit.get("_id"),
+        "_score": chunk_hit.get("_score", parent_hit.get("_score")),
+        "parent_id": parent_id,
+        "chunk_index": chunk_index,
+        "title": parent_src.get("title"),
+        "subtitle": parent_src.get("subtitle") or "",
+        "description": parent_src.get("description"),
+        "keywords": parent_src.get("keywords") or [],
+        "topics": parent_src.get("topics") or [],
+        "themes": parent_src.get("themes") or [],
+        "languages": parent_src.get("languages") or [],
+        "locations": parent_src.get("locations") or [],
+        "category": parent_src.get("category"),
+        "projectAcronym": parent_src.get("project_acronym"),
+        "projectName": parent_src.get("project_name"),
+        "projectDisplayName": project_display,
+        "project_type": parent_src.get("project_type"),
+        "project_id": parent_src.get("project_id"),
+        "projectUrl": parent_src.get("project_url"),
+        "@id": parent_src.get("@id"),
+        "_orig_id": parent_src.get("_orig_id"),
+        "date_of_completion": parent_src.get("date_of_completion"),
+        "content_chunk": chunk_text,
+        "ko_content_flat_summarised": parent_src.get("ko_content_flat_summarised"),
+        "llm_context": _build_llm_context(merged_src),
+        "citation_label": f"{parent_id}#c{chunk_index}",
+    }
+
+
+def expand_llm_result_items(hit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    inner_hits = ((((hit or {}).get("inner_hits") or {}).get("best_chunks") or {}).get("hits") or {}).get("hits") or []
+    if inner_hits:
+        items = []
+        for chunk_hit in inner_hits:
+            item = _format_llm_result_item_from_chunk(hit, chunk_hit)
+            if item:
+                items.append(item)
+        return items
+
+    fallback = _format_llm_result_item_from_chunk(hit, hit)
+    return [fallback] if fallback else []
+
+
+async def build_llm_retrieval_response(
+    response: Dict[str, Any],
+    index_name: str,
+    top_k: int,
+    max_chunks_per_parent: int,
+) -> Dict[str, Any]:
+    hits = ((response.get("hits") or {}).get("hits")) or []
+    parent_ids = []
+    for hit in hits:
+        src = (hit.get("_source") or {})
+        pid = src.get("parent_id") or src.get("_orig_id")
+        if pid:
+            parent_ids.append(pid)
+
+    meta_map = fetch_meta_fields_for_parents(
+        index_name,
+        list(dict.fromkeys(parent_ids)),
+        ["ko_content_flat_summarised"],
+    ) if parent_ids else {}
+
+    enriched_hits = []
+    for hit in hits:
+        src = (hit.get("_source") or {})
+        pid = src.get("parent_id") or src.get("_orig_id")
+        if pid and pid in meta_map:
+            hit = dict(hit)
+            merged_src = dict(src)
+            merged_src.update(meta_map[pid])
+            hit["_source"] = merged_src
+        enriched_hits.append(hit)
+
+    formatted_results = []
+    seen_ids = set()
+    per_parent_counts: Dict[str, int] = {}
+
+    target_k = max(1, int(top_k))
+    parent_limit = max(1, int(max_chunks_per_parent))
+
+    for hit in enriched_hits:
+        for item in expand_llm_result_items(hit):
+            item_id = item.get("_id")
+            parent_id = item.get("parent_id")
+            chunk_index = item.get("chunk_index")
+            dedupe_key = f"{item_id}:{chunk_index}"
+            if dedupe_key in seen_ids or not parent_id:
+                continue
+            if per_parent_counts.get(parent_id, 0) >= parent_limit:
+                continue
+
+            seen_ids.add(dedupe_key)
+            per_parent_counts[parent_id] = per_parent_counts.get(parent_id, 0) + 1
+            formatted_results.append(item)
+
+            if len(formatted_results) >= target_k:
+                break
+        if len(formatted_results) >= target_k:
+            break
+
+    response_json = {
+        "data": formatted_results,
+        "pagination": {
+            "total_records": len(formatted_results),
+            "current_page": 1,
+            "total_pages": 1,
+            "next_page": None,
+            "prev_page": None,
+        },
+    }
+
+    meta = response.get("_meta")
+    response_json["_meta"] = dict(meta) if isinstance(meta, dict) else {}
+    response_json["_meta"]["retrieval_mode"] = "llm"
+    response_json["_meta"]["returned_chunks"] = len(formatted_results)
+    response_json["_meta"]["max_chunks_per_parent"] = parent_limit
 
     return response_json
 

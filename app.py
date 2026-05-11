@@ -27,6 +27,7 @@ from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
 from services.mongo_ko_metadata_sync import sync_ko_metadata_from_opensearch, MongoKOMetadataSyncRequest
 from services.record_details import get_record_details, RecordDetailsRequest
 from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
+from services.search_endpoint_helpers import build_llm_retrieval_response
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
                             fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent)
@@ -244,6 +245,112 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         filters=filters,
         response_json=response_json,
         request_k=(request.k if (getattr(request, "k", None) is not None) else None),
+        t0=t0,
+    )
+
+    return response_json
+
+
+@app.post("/llm_retrieve", tags=["Search"],
+          summary="LLM-oriented chunk retrieval",
+          response_description="Chunk-level retrieval results optimized for chatbot grounding and citations.",
+          responses={
+              401: {"description": "Authentication required or invalid credentials."},
+              422: {"description": "Invalid request payload."},
+              502: {"description": "Upstream OpenSearch request failed."},
+          },
+          description="""
+          Performs semantic-first retrieval using the same tuned search logic as `/neural_search_relevant`,
+          but returns chunk-level evidence units for LLM grounding instead of parent-grouped search UX
+          results. The `k` parameter is treated as the number of evidence chunks to return.
+          """)
+async def llm_retrieve_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    page_number = 1
+    original_query = request.search_term.strip()
+    query = original_query
+
+    t0 = time.monotonic()
+    access_token = request.access_token
+
+    translation_allowed, _, user_id = await resolve_auth_context(
+        access_token=access_token,
+        dev=bool(request.dev),
+        include_summary_flag=False,
+    )
+
+    filters = {
+        "topics": request.topics,
+        "themes": request.themes,
+        "languages": request.languages,
+        "category": request.category,
+        "project_type": request.project_type,
+        "project_acronym": request.project_acronym,
+        "locations": request.locations,
+        "sort_by": getattr(request, "sort_by", None),
+    }
+
+    detected_lang = "en"
+    translated = False
+    if translation_allowed:
+        from services.language_detect import detect_language
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
+
+    query_profile = build_default_query_profile(query)
+    use_semantic = bool(query_profile.get("use_semantic", True))
+
+    model_key = request.model.lower().strip() if request.model else "msmarco"
+    model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
+    index_name = model_config["index"]
+    if request.dev:
+        index_name += "_dev"
+
+    retrieval_k = int(request.k) if (request.k is not None and request.k > 0) else 5
+    raw_fetch_size = min(max(retrieval_k * 3, retrieval_k), 50)
+
+    response = neural_search_relevant(
+        index_name=index_name,
+        query=query,
+        filters=filters,
+        page=page_number,
+        model_id=model_config["model_id"],
+        use_semantic=use_semantic,
+        size_override=raw_fetch_size,
+        debug_profile=bool(getattr(request, "debug_profile", False)),
+        debug_explain=bool(getattr(request, "debug_explain", False)),
+        query_profile=query_profile,
+    )
+
+    response_json = await build_llm_retrieval_response(
+        response=response,
+        index_name=index_name,
+        top_k=retrieval_k,
+        max_chunks_per_parent=2,
+    )
+
+    await log_search_event(
+        ch_logger=ch_logger,
+        request_temp=request_temp,
+        endpoint="/llm_retrieve",
+        original_query=original_query,
+        query=query,
+        detected_lang=detected_lang,
+        translated=translated,
+        translation_allowed=translation_allowed,
+        user_id=user_id,
+        model_key=model_key,
+        index_name=index_name,
+        use_semantic=use_semantic,
+        filters=filters,
+        response_json=response_json,
+        request_k=retrieval_k,
         t0=t0,
     )
 

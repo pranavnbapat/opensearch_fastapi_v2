@@ -4,8 +4,8 @@ set -eu
 # Build and push the OpenSearch FastAPI image to GHCR.
 #
 # Usage:
-#   ./deploy.sh          # tag = latest
-#   ./deploy.sh v3       # tag = v3
+#   ./build_and_push.sh          # tag = inferred from docker-compose.yml, else latest
+#   ./build_and_push.sh v3       # tag = v3
 #
 # Optional environment overrides:
 #   REGISTRY=ghcr.io/pranavnbapat
@@ -25,10 +25,25 @@ set -eu
 
 REGISTRY="${REGISTRY:-ghcr.io/pranavnbapat}"
 IMAGE_NAME="${IMAGE_NAME:-${REGISTRY}/opensearch_fastapi}"
-TAG="${1:-latest}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 DOCKERFILE="${DOCKERFILE:-Dockerfile}"
 CONTEXT="${CONTEXT:-.}"
+
+infer_default_tag() {
+    compose_file="${CONTEXT%/}/docker-compose.yml"
+    if [ -f "${compose_file}" ]; then
+        image_ref="$(awk '/^[[:space:]]*image:[[:space:]]*/ {print $2; exit}' "${compose_file}")"
+        case "${image_ref}" in
+            *:*)
+                echo "${image_ref##*:}"
+                return 0
+                ;;
+        esac
+    fi
+    echo "latest"
+}
+
+TAG="${1:-$(infer_default_tag)}"
 
 FULL_IMAGE="${IMAGE_NAME}:${TAG}"
 
