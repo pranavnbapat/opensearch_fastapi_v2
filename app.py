@@ -44,6 +44,39 @@ load_dotenv()
 ch_logger = None
 
 
+def _request_attribution(request: Request) -> dict[str, str]:
+    xff = request.headers.get("x-forwarded-for", "")
+    return {
+        "client_host": request.client.host if request.client else "",
+        "forwarded_ip": xff.split(",")[0].strip() if xff else "",
+        "x_forwarded_for": xff,
+        "x_real_ip": request.headers.get("x-real-ip", ""),
+        "user_agent": request.headers.get("user-agent", ""),
+        "referer": request.headers.get("referer", ""),
+        "origin": request.headers.get("origin", ""),
+        "search_source": request.headers.get("x-search-source", ""),
+        "request_id": request.headers.get("x-request-id", "") or request.headers.get("x-correlation-id", ""),
+    }
+
+
+def _log_request_attribution(request: Request, endpoint: str, **extra: object) -> None:
+    fields = _request_attribution(request)
+    logger.info(
+        "[REQUEST] endpoint=%s client_host=%s forwarded_ip=%s xff=%s real_ip=%s source=%s ua=%s referer=%s origin=%s request_id=%s extra=%s",
+        endpoint,
+        fields["client_host"] or "-",
+        fields["forwarded_ip"] or "-",
+        fields["x_forwarded_for"] or "-",
+        fields["x_real_ip"] or "-",
+        fields["search_source"] or "-",
+        fields["user_agent"] or "-",
+        fields["referer"] or "-",
+        fields["origin"] or "-",
+        fields["request_id"] or "-",
+        extra or {},
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -101,6 +134,15 @@ HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lo
           lexical-first mode. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    _log_request_attribution(
+        request_temp,
+        "/neural_search_relevant",
+        search_term=(request.search_term or "").strip(),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
     try:
         raw_payload = await request_temp.json()
@@ -265,6 +307,15 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
           results. The `k` parameter is treated as the number of evidence chunks to return.
           """)
 async def llm_retrieve_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    _log_request_attribution(
+        request_temp,
+        "/llm_retrieve",
+        search_term=(request.search_term or "").strip(),
+        k=request.k,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     page_number = 1
     original_query = request.search_term.strip()
     query = original_query
@@ -373,6 +424,16 @@ async def llm_retrieve_endpoint(request_temp: Request, request: RelevantSearchRe
           same retrieval behavior as `/neural_search_relevant`.
           """)
 async def neural_search_relevant_advanced_endpoint(request_temp: Request, request: RelevantSearchRequestAdvanced):
+    _log_request_attribution(
+        request_temp,
+        "/neural_search_relevant_advanced",
+        search_term=(request.search_term or "").strip(),
+        advanced=bool(getattr(request, "advanced", False)),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     try:
         raw_payload = await request_temp.json()
     except Exception:
@@ -561,6 +622,15 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
           relative to `/neural_search_relevant` and is mainly useful when you want OpenSearch-side score fusion.
           """)
 async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request: RelevantSearchRequestHybrid):
+    _log_request_attribution(
+        request_temp,
+        "/neural_search_relevant_hybrid",
+        search_term=(request.search_term or "").strip(),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
     try:
         raw_payload = await request_temp.json()
@@ -778,6 +848,15 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
           retrieval experiments. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_sparse_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    _log_request_attribution(
+        request_temp,
+        "/neural_search_relevant_sparse",
+        search_term=(request.search_term or "").strip(),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     # --- DEBUG: raw inbound request body (includes access_token if sent) ---
     try:
         raw_payload = await request_temp.json()
@@ -969,8 +1048,20 @@ async def sync_ko_metadata_from_record_details_endpoint(request: MongoKOMetadata
           similarity from the seed meta document. Supports exact or ANN retrieval and can use content, title,
           description, keywords, or a weighted mix of embedding spaces. No request-time filters are applied.
           """)
-async def recommend_similar_knn_endpoint(request: RecommendKNNRequest):
+async def recommend_similar_knn_endpoint(request_temp: Request, request: RecommendKNNRequest):
     parent_id = request.parent_id.strip()
+
+    _log_request_attribution(
+        request_temp,
+        "/recommend_similar_knn",
+        parent_id=parent_id,
+        k=request.k,
+        k_candidates=request.k_candidates,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+        mode=request.mode,
+        space=request.space,
+    )
 
     model_key = request.model.lower().strip() if request.model else "msmarco"
     model_config = MODEL_CONFIG.get(model_key, MODEL_CONFIG["msmarco"])
@@ -1018,6 +1109,15 @@ async def recommend_similar_knn_endpoint(request: RecommendKNNRequest):
           endpoint.
           """)
 async def neural_search_relevant_endpoint_new(request_temp: Request, request: RelevantSearchRequestNew):
+    _log_request_attribution(
+        request_temp,
+        "/neural_search_relevant_new",
+        search_term=(request.search_term or "").strip(),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
+
     page_number = max(request.page, 1)
 
     query = request.search_term.strip()
