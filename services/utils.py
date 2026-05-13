@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 from typing import Optional
 
+from fastapi import HTTPException
 from nltk.corpus import stopwords
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -55,6 +56,10 @@ OPENSEARCH_PWD = os.getenv("OPENSEARCH_PWD")
 
 BASIC_AUTH_USER = os.getenv("BASIC_AUTH_USER")
 BASIC_AUTH_PASS = os.getenv("BASIC_AUTH_PASS")
+TRUSTED_PROXY_TOKEN = (os.getenv("EUF_OPENSEARCH_TRUSTED_PROXY_TOKEN") or "").strip()
+REQUIRE_TRUSTED_PROXY = (
+    os.getenv("EUF_OPENSEARCH_REQUIRE_TRUSTED_PROXY", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
 
 if not all([OPENSEARCH_API, OPENSEARCH_USR, OPENSEARCH_PWD]):
     raise EnvironmentError("Missing OpenSearch environment variables!")
@@ -104,6 +109,25 @@ class MultiUserTimedAuthMiddleware(BaseHTTPMiddleware):
                             content="Access expired")
 
         return await call_next(request)
+
+
+def enforce_trusted_proxy(request: Request, endpoint: str) -> None:
+    if not REQUIRE_TRUSTED_PROXY:
+        return
+
+    request_token = (request.headers.get("x-internal-proxy-token") or "").strip()
+    if TRUSTED_PROXY_TOKEN and request_token == TRUSTED_PROXY_TOKEN:
+        return
+
+    logger.warning(
+        "[TRUSTED_PROXY] Rejected endpoint=%s client_host=%s forwarded_ip=%s ua=%s source=%s",
+        endpoint,
+        request.client.host if request.client else "-",
+        request.headers.get("x-forwarded-for", "-"),
+        request.headers.get("user-agent", "-"),
+        request.headers.get("x-search-source", "-"),
+    )
+    raise HTTPException(status_code=403, detail="Trusted upstream required")
 
 
 def remove_stopwords_from_query(query: str) -> str:

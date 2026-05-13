@@ -30,7 +30,8 @@ from services.search_endpoint_helpers import maybe_translate_query, resolve_auth
 from services.search_endpoint_helpers import build_llm_retrieval_response
 from services.summariser_hf import summarise_top5_hf
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
-                            fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent)
+                            fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent,
+                            enforce_trusted_proxy)
 from tools.debug_llm_summary import build_llm_summary_from_explain_top3, build_llm_summary_from_advanced_matches
 from tools.llm_explain_client import explain_debug_non_technical
 
@@ -134,6 +135,7 @@ HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lo
           lexical-first mode. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    enforce_trusted_proxy(request_temp, "/neural_search_relevant")
     _log_request_attribution(
         request_temp,
         "/neural_search_relevant",
@@ -424,6 +426,7 @@ async def llm_retrieve_endpoint(request_temp: Request, request: RelevantSearchRe
           same retrieval behavior as `/neural_search_relevant`.
           """)
 async def neural_search_relevant_advanced_endpoint(request_temp: Request, request: RelevantSearchRequestAdvanced):
+    enforce_trusted_proxy(request_temp, "/neural_search_relevant_advanced")
     _log_request_attribution(
         request_temp,
         "/neural_search_relevant_advanced",
@@ -622,6 +625,7 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
           relative to `/neural_search_relevant` and is mainly useful when you want OpenSearch-side score fusion.
           """)
 async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request: RelevantSearchRequestHybrid):
+    enforce_trusted_proxy(request_temp, "/neural_search_relevant_hybrid")
     _log_request_attribution(
         request_temp,
         "/neural_search_relevant_hybrid",
@@ -848,6 +852,7 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
           retrieval experiments. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_sparse_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    enforce_trusted_proxy(request_temp, "/neural_search_relevant_sparse")
     _log_request_attribution(
         request_temp,
         "/neural_search_relevant_sparse",
@@ -1049,6 +1054,7 @@ async def sync_ko_metadata_from_record_details_endpoint(request: MongoKOMetadata
           description, keywords, or a weighted mix of embedding spaces. No request-time filters are applied.
           """)
 async def recommend_similar_knn_endpoint(request_temp: Request, request: RecommendKNNRequest):
+    enforce_trusted_proxy(request_temp, "/recommend_similar_knn")
     parent_id = request.parent_id.strip()
 
     _log_request_attribution(
