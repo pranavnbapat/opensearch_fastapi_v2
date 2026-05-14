@@ -133,6 +133,7 @@ async def build_response_json(
     query: str,
     summary_provider: str,
     summarise_top5_hf_fn,  # pass the function in to avoid circular imports
+    summarise_topk_llm_fn=None,
 ) -> Dict[str, Any]:
     grouped = response.get("grouped", {}) or {}
     parents = grouped.get("parents", []) or []
@@ -198,6 +199,11 @@ async def build_response_json(
     if include_summary and summary_provider == "hf":
         # Caller ensures auth eligibility; here we just compute.
         summary = summarise_top5_hf_fn(query=query, hits=formatted_results)
+    elif include_summary and summary_provider == "llm" and summarise_topk_llm_fn is not None:
+        try:
+            summary = await summarise_topk_llm_fn(query=query, hits=formatted_results)
+        except Exception:
+            summary = None
 
     response_json = {
         "summary": summary,

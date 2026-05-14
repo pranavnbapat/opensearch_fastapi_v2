@@ -12,7 +12,7 @@ HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_BASE_URL = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1").rstrip("/")
 HF_MODEL_ID = os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 
-SUMMARY_TIMEOUT_S = float(os.getenv("SUMMARY_TIMEOUT_S", "15.0"))
+SUMMARY_TIMEOUT_S = float(os.getenv("SUMMARY_TIMEOUT_S", "10.0"))
 SUMMARY_MAX_DESC_CHARS = int(os.getenv("SUMMARY_MAX_DESC_CHARS", "250"))
 SUMMARY_MAX_CONCURRENCY = int(os.getenv("SUMMARY_MAX_CONCURRENCY", "4"))
 

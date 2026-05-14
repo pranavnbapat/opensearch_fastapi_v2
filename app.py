@@ -29,6 +29,7 @@ from services.record_details import get_record_details, RecordDetailsRequest
 from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
 from services.search_endpoint_helpers import build_llm_retrieval_response
 from services.summariser_hf import summarise_top5_hf
+from services.summariser_llm import summarise_topk_llm
 from services.utils import (BASIC_AUTH_PASS, BASIC_AUTH_USER, MODEL_CONFIG, MultiUserTimedAuthMiddleware,
                             fetch_chunks_for_parents, PAGE_SIZE, save_debug_dump, infer_query_intent,
                             enforce_trusted_proxy)
@@ -116,7 +117,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUMMARY_PROVIDER = (os.getenv("SUMMARY_PROVIDER") or "").lower()
+SUMMARY_PROVIDER = (os.getenv("SUMMARY_PROVIDER") or "llm").lower()
 HYBRID_SEARCH_PIPELINE = os.getenv("HYBRID_SEARCH_PIPELINE", "eufb-hybrid-v1")
 HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lower() in {"1", "true", "yes", "on"})
 
@@ -237,6 +238,7 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         query=query,
         summary_provider=SUMMARY_PROVIDER,
         summarise_top5_hf_fn=summarise_top5_hf,
+        summarise_topk_llm_fn=summarise_topk_llm,
     )
 
     logger.info("Search Query: '%s', Semantic: %s, Mode: %s, Index: %s, Page: %d",
@@ -542,6 +544,7 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
         query=query,
         summary_provider=SUMMARY_PROVIDER,
         summarise_top5_hf_fn=summarise_top5_hf,
+        summarise_topk_llm_fn=summarise_topk_llm,
     )
 
     logger.info("Advanced Search Query: '%s', Advanced: %s, Semantic: %s, Index: %s, Page: %d",
@@ -738,6 +741,7 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
         query=query,
         summary_provider=SUMMARY_PROVIDER,
         summarise_top5_hf_fn=summarise_top5_hf,
+        summarise_topk_llm_fn=summarise_topk_llm,
     )
 
     logger.info(
@@ -941,6 +945,7 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
         query=query,
         summary_provider=SUMMARY_PROVIDER,
         summarise_top5_hf_fn=summarise_top5_hf,
+        summarise_topk_llm_fn=summarise_topk_llm,
     )
 
     logger.info("[SPARSE] Search Query: '%s', Index: %s, Page: %d, Analyzer: %s",
