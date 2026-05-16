@@ -1015,10 +1015,14 @@ async def record_details_endpoint(request: RecordDetailsRequest):
           },
           description="""
           Iterates MongoDB `logical_layer.ko_metadata`, looks up each KO in OpenSearch via `@id`,
-          and syncs the following fields into MongoDB: `title`, `title_original`, `subtitle`,
-          `subtitle_original`, `keywords`, `keywords_original`, `description`, `description_original`,
-          and `ko_content_flat_summarised`. Default mode is `DEV`. Default execution is dry-run.
-          Missing lookups are skipped; the process continues.
+          syncs the logical-layer fields `title`, `title_original`, `subtitle`, `subtitle_original`,
+          `keywords`, `keywords_original`, `description`, `description_original`, and
+          `ko_content_flat_summarised`, then also updates the linked `physical_layer.ko_metadata`
+          document via `physical_layer_ko_metadata_id`. The synced physical-layer fields are
+          `ko_metadata.title`, `ko_metadata.subtitle`, `ko_metadata.description`, and
+          `ko_metadata.keywords`, preferring `*_original` values from OpenSearch when present.
+          Default mode is `DEV`. Default execution is dry-run. Missing lookups are skipped;
+          missing physical-layer ids are also skipped and do not stop the run.
           """)
 async def sync_ko_metadata_from_record_details_endpoint(request: MongoKOMetadataSyncRequest):
     model_key = request.model.lower().strip() if request.model else "msmarco"
@@ -1033,13 +1037,15 @@ async def sync_ko_metadata_from_record_details_endpoint(request: MongoKOMetadata
         index_name=index_name,
     )
 
-    logger.info("[SYNC KO METADATA] mode=%s dry_run=%s scanned=%s matched=%s updated=%s skipped_missing_lookup=%s errors=%s",
+    logger.info("[SYNC KO METADATA] mode=%s dry_run=%s scanned=%s matched=%s updated=%s physical_updated=%s skipped_missing_lookup=%s skipped_missing_physical_id=%s errors=%s",
                 request.mode,
                 request.dry_run,
                 response.get("scanned"),
                 response.get("matched"),
                 response.get("updated"),
+                response.get("physical_updated"),
                 response.get("skipped_missing_lookup"),
+                response.get("skipped_missing_physical_id"),
                 response.get("errors"))
 
     return response
