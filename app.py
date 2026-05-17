@@ -26,7 +26,7 @@ from services.neural_search_relevant_new import (neural_search_relevant_new, spl
 from services.recommender_knn import recommend_similar_knn, RecommendKNNRequest
 from services.mongo_ko_metadata_sync import sync_ko_metadata_from_opensearch, MongoKOMetadataSyncRequest
 from services.record_details import get_record_details, RecordDetailsRequest
-from services.search_endpoint_helpers import maybe_translate_query, resolve_auth_context, build_response_json, log_search_event
+from services.search_endpoint_helpers import process_query_text, resolve_auth_context, build_response_json, log_search_event
 from services.search_endpoint_helpers import build_llm_retrieval_response
 from services.summariser_hf import summarise_top5_hf
 from services.summariser_llm import summarise_topk_llm
@@ -201,17 +201,7 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
     detected_lang = "en"
     translated = False
     
-    if translation_allowed:
-        from services.language_detect import detect_language
-        try:
-            detected_lang = detect_language(query).lower()
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-    
-    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
-    if translated_query != query:
-        translated = True
-    query = translated_query
+    query, detected_lang, translated, _ = await process_query_text(query, translation_allowed)
 
     query_profile = build_default_query_profile(query)
     use_semantic = bool(query_profile.get("use_semantic", True))
@@ -371,17 +361,7 @@ async def llm_retrieve_endpoint(request_temp: Request, request: RelevantSearchRe
 
     detected_lang = "en"
     translated = False
-    if translation_allowed:
-        from services.language_detect import detect_language
-        try:
-            detected_lang = detect_language(query).lower()
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-
-    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
-    if translated_query != query:
-        translated = True
-    query = translated_query
+    query, detected_lang, translated, _ = await process_query_text(query, translation_allowed)
 
     query_profile = build_default_query_profile(query)
     use_semantic = bool(query_profile.get("use_semantic", True))
@@ -502,17 +482,7 @@ async def neural_search_relevant_advanced_endpoint(request_temp: Request, reques
     detected_lang = "en"
     translated = False
 
-    if translation_allowed:
-        from services.language_detect import detect_language
-        try:
-            detected_lang = detect_language(query).lower()
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-
-    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
-    if translated_query != query:
-        translated = True
-    query = translated_query
+    query, detected_lang, translated, _ = await process_query_text(query, translation_allowed)
 
     use_semantic, _, _, _, _ = infer_query_intent(
         query,
@@ -690,17 +660,7 @@ async def neural_search_relevant_hybrid_endpoint(request_temp: Request, request:
     detected_lang = "en"
     translated = False
     
-    if translation_allowed:
-        from services.language_detect import detect_language
-        try:
-            detected_lang = detect_language(query).lower()
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-    
-    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
-    if translated_query != query:
-        translated = True
-    query = translated_query
+    query, detected_lang, translated, _ = await process_query_text(query, translation_allowed)
 
     # Query-intent routing (same as /neural_search_relevant, configurable via env)
     use_semantic_hybrid, _, _, _, _ = infer_query_intent(
@@ -918,17 +878,7 @@ async def neural_search_relevant_sparse_endpoint(request_temp: Request, request:
     detected_lang = "en"
     translated = False
     
-    if translation_allowed:
-        from services.language_detect import detect_language
-        try:
-            detected_lang = detect_language(query).lower()
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-    
-    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
-    if translated_query != query:
-        translated = True
-    query = translated_query
+    query, detected_lang, translated, _ = await process_query_text(query, translation_allowed)
 
     filters = {
         "topics": request.topics,

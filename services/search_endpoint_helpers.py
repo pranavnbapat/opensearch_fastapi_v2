@@ -1,7 +1,12 @@
 # services/search_endpoint_helpers.py
 
+import json
 import logging
+import os
+import re
 import time
+
+import httpx
 
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +16,150 @@ from services.utils import is_translation_allowed, jwt_claim, PAGE_SIZE, fetch_c
 
 
 logger = logging.getLogger(__name__)
+
+LLM_URL = (os.getenv("LLM_URL") or "").strip()
+LLM_MODEL = (os.getenv("LLM_MODEL") or "").strip()
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("LLM_KEY") or "").strip()
+QUERY_CORRECTION_ENABLED = (os.getenv("QUERY_CORRECTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"})
+QUERY_CORRECTION_TIMEOUT_S = float(os.getenv("QUERY_CORRECTION_TIMEOUT_S", "6.0"))
+QUERY_CORRECTION_MAX_TOKENS = int(os.getenv("QUERY_CORRECTION_MAX_TOKENS", "80"))
+
+
+def _extract_json_object(content: str) -> Optional[str]:
+    content = (content or "").strip()
+    if not content:
+        return None
+
+    code_fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, re.DOTALL)
+    if code_fence_match:
+        return code_fence_match.group(1)
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    return content[start:end + 1]
+
+
+def _normalise_corrected_query(content: str) -> Optional[str]:
+    extracted = _extract_json_object(content)
+    if extracted:
+        try:
+            payload = json.loads(extracted)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            corrected = payload.get("corrected_query")
+            if isinstance(corrected, str):
+                corrected = corrected.strip()
+                return corrected or None
+
+    plain = (content or "").strip()
+    if not plain or plain.lower() == "null":
+        return None
+    return plain
+
+
+async def maybe_correct_query(query: str, language_code: str, correction_allowed: bool) -> str:
+    if not correction_allowed:
+        logger.info("Query correction not allowed; skipping LLM typo correction.")
+        return query
+
+    if not QUERY_CORRECTION_ENABLED or not LLM_URL or not LLM_MODEL:
+        logger.info(
+            "Query correction unavailable: enabled=%s llm_url_present=%s llm_model_present=%s",
+            QUERY_CORRECTION_ENABLED,
+            bool(LLM_URL),
+            bool(LLM_MODEL),
+        )
+        return query
+
+    prompt = "\n".join([
+        "Task: Correct only obvious spelling or typographical mistakes in this search query.",
+        f"Language code: {language_code or 'unknown'}",
+        f'Original query: "{query}"',
+        "",
+        "Rules:",
+        "- Preserve the user's intent.",
+        "- Do not translate the query.",
+        "- Do not add new concepts or extra words unless needed to fix a clear typo.",
+        "- Keep domain-specific names, project names, acronyms, and place names unless they contain an obvious typo.",
+        "- If no correction is needed, return the original query unchanged.",
+        '- Return valid JSON only: {"corrected_query":"...","changed":true}',
+    ])
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "You correct search-query typos conservatively and return strict JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": QUERY_CORRECTION_MAX_TOKENS,
+    }
+
+    endpoint = LLM_URL.rstrip("/")
+    if not endpoint.endswith("/v1/chat/completions"):
+        endpoint = f"{endpoint}/v1/chat/completions"
+
+    timeout = httpx.Timeout(connect=5.0, read=QUERY_CORRECTION_TIMEOUT_S, write=10.0, pool=5.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        content = (data.get("choices") or [])[0].get("message", {}).get("content", "").strip()
+        corrected_query = _normalise_corrected_query(content)
+    except Exception as exc:
+        logger.warning("Query correction failed for query=%r language=%s: %s", query, language_code, exc)
+        return query
+
+    if not corrected_query:
+        return query
+
+    if corrected_query != query:
+        logger.info(
+            "Query correction applied: original=%r corrected=%r language=%s",
+            query,
+            corrected_query,
+            language_code,
+        )
+    else:
+        logger.info("Query correction made no change for query=%r language=%s", query, language_code)
+    return corrected_query
+
+
+async def process_query_text(query: str, translation_allowed: bool) -> tuple[str, str, bool, bool]:
+    detected_lang = "en"
+    translated = False
+    corrected = False
+
+    if translation_allowed:
+        try:
+            detected_lang = detect_language(query).lower()
+        except Exception as e:
+            logger.warning(f"Language detection failed: {e}")
+
+        corrected_query = await maybe_correct_query(
+            query=query,
+            language_code=detected_lang,
+            correction_allowed=translation_allowed,
+        )
+        if corrected_query != query:
+            corrected = True
+            query = corrected_query
+
+    translated_query = maybe_translate_query(query, translation_allowed=translation_allowed)
+    if translated_query != query:
+        translated = True
+    query = translated_query
+
+    return query, detected_lang, translated, corrected
 
 
 def maybe_translate_query(query: str, translation_allowed: bool) -> str:
@@ -208,6 +357,7 @@ async def build_response_json(
     ]
 
     summary = None
+    summary_segments = None
     if include_summary and summary_provider == "hf":
         # Caller ensures auth eligibility; here we just compute.
         logger.info(
@@ -227,10 +377,14 @@ async def build_response_json(
             page_number,
         )
         try:
-            summary = await summarise_topk_llm_fn(query=query, hits=formatted_results)
+            summary_payload = await summarise_topk_llm_fn(query=query, hits=formatted_results)
+            if isinstance(summary_payload, dict):
+                summary = summary_payload.get("summary")
+                summary_segments = summary_payload.get("summary_segments")
         except Exception:
             logger.exception("Summary generation crashed: provider=llm query=%r", query)
             summary = None
+            summary_segments = None
     else:
         logger.info(
             "Summary generation skipped: include_summary=%s provider=%s has_llm_fn=%s query=%r results=%d",
@@ -251,6 +405,7 @@ async def build_response_json(
 
     response_json = {
         "summary": summary,
+        "summary_segments": summary_segments,
         "data": formatted_results,
         "related_projects_from_this_page": related_projects_from_this_page,
         "related_projects_from_entire_resultset": related_projects_all,

@@ -365,6 +365,8 @@ VALIDATE_ACCESS_TOKEN_DEV_URL = os.getenv(
     "VALIDATE_ACCESS_TOKEN_DEV_URL",
     "https://backend-admin.dev.farmbook.ugent.be/fastapi/validate_access_token/",
 )
+BACKEND_DEV_USERNAME = (os.getenv("BACKEND_DEV_USERNAME") or "").strip()
+BACKEND_DEV_PASSWORD = (os.getenv("BACKEND_DEV_PASSWORD") or "").strip()
 
 VALIDATE_ACCESS_TOKEN_PRD_URL = os.getenv(
     "VALIDATE_ACCESS_TOKEN_PRD_URL",
@@ -379,11 +381,18 @@ async def is_translation_allowed(access_token: str | None, is_dev: bool) -> bool
         return False
 
     url = VALIDATE_ACCESS_TOKEN_DEV_URL if is_dev else VALIDATE_ACCESS_TOKEN_PRD_URL
+    auth = None
+    if is_dev and BACKEND_DEV_USERNAME and BACKEND_DEV_PASSWORD:
+        auth = httpx.BasicAuth(BACKEND_DEV_USERNAME, BACKEND_DEV_PASSWORD)
 
     try:
         # Use a short timeout so search is not blocked too long by auth issues
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.post(url, json={"access_token": access_token})
+            resp = await client.post(
+                url,
+                json={"access_token": access_token},
+                auth=auth,
+            )
 
         if resp.status_code != 200:
             logger.warning(

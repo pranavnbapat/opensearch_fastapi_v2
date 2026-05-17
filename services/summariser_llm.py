@@ -1,9 +1,11 @@
 import asyncio
+import ast
+import json
 import logging
 import os
 import re
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 import httpx
 
@@ -20,6 +22,16 @@ SUMMARY_MIN_MAX_TOKENS = int(os.getenv("SUMMARY_MIN_MAX_TOKENS", "100"))
 SUMMARY_MAX_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_MAX_TOKENS", "300"))
 
 _sem = asyncio.Semaphore(SUMMARY_MAX_CONCURRENCY)
+
+
+class SummarySegment(TypedDict):
+    text: str
+    highlight: bool
+
+
+class SummaryPayload(TypedDict):
+    summary: str
+    summary_segments: List[SummarySegment]
 
 
 def _clip(text: Optional[str], limit: int) -> str:
@@ -51,12 +63,16 @@ def _build_prompt(query: str, hits: List[Dict[str, Any]]) -> str:
         "Task: Write one short neutral summary about the query topic using only the evidence below.",
         "",
         "Rules:",
-        "- Return plain text only.",
         "- Use at most 120 words.",
         "- Do not mention the number of results.",
         "- Do not mention that you used search results or documents.",
         "- Do not add bullets, markdown, or explanations.",
+        "- Highlight only the most relevant topic phrases, not every keyword.",
         "- If the evidence is insufficient, return exactly: null",
+        "- Return valid JSON only with this shape:",
+        '  {"summary":"...","summary_segments":[{"text":"...","highlight":false}]}',
+        '- The concatenated "text" values in summary_segments must equal summary exactly.',
+        '- Use boolean true/false for "highlight".',
         "",
         "Evidence:",
     ]
@@ -73,7 +89,146 @@ def _summary_max_tokens(query: str, hits: List[Dict[str, Any]]) -> int:
     return max(SUMMARY_MIN_MAX_TOKENS, min(SUMMARY_MAX_MAX_TOKENS, dynamic_budget))
 
 
-async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
+def _extract_json_object(content: str) -> Optional[str]:
+    content = (content or "").strip()
+    if not content:
+        return None
+
+    code_fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, re.DOTALL)
+    if code_fence_match:
+        return code_fence_match.group(1)
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    return content[start:end + 1]
+
+
+def _coerce_payload(candidate: Any) -> Optional[SummaryPayload]:
+    if not isinstance(candidate, dict):
+        return None
+
+    summary = candidate.get("summary")
+    raw_segments = candidate.get("summary_segments")
+    if not isinstance(summary, str):
+        return None
+    summary = summary.strip()
+    if not summary:
+        return None
+
+    segments: List[SummarySegment] = []
+    if isinstance(raw_segments, list):
+        for item in raw_segments:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            segments.append({
+                "text": text,
+                "highlight": bool(item.get("highlight", False)),
+            })
+
+    if segments:
+        joined = "".join(segment["text"] for segment in segments)
+        if joined != summary:
+            segments = []
+
+    return {
+        "summary": summary,
+        "summary_segments": segments,
+    }
+
+
+def _extract_summary_and_segments_by_regex(content: str) -> Optional[SummaryPayload]:
+    summary_match = re.search(r'"summary"\s*:\s*"((?:\\.|[^"])*)"', content, re.DOTALL)
+    if not summary_match:
+        return None
+
+    try:
+        summary = json.loads(f'"{summary_match.group(1)}"')
+    except Exception:
+        return None
+
+    segments_match = re.search(r'"summary_segments"\s*:\s*(\[[\s\S]*\])', content, re.DOTALL)
+    if not segments_match:
+        return {"summary": summary, "summary_segments": []}
+
+    try:
+        raw_segments = json.loads(segments_match.group(1))
+    except Exception:
+        return {"summary": summary, "summary_segments": []}
+
+    return _coerce_payload({
+        "summary": summary,
+        "summary_segments": raw_segments,
+    })
+
+
+def _build_fallback_segments(summary: str, query: str) -> List[SummarySegment]:
+    summary = (summary or "").strip()
+    if not summary:
+        return []
+
+    query_terms = [
+        term.strip()
+        for term in re.split(r"\s+", query.strip())
+        if term.strip()
+    ]
+    phrases = sorted(
+        {query.strip(), *query_terms},
+        key=len,
+        reverse=True,
+    )
+    phrases = [phrase for phrase in phrases if len(phrase) >= 2]
+    if not phrases:
+        return [{"text": summary, "highlight": False}]
+
+    pattern = re.compile("(" + "|".join(re.escape(phrase) for phrase in phrases) + ")", re.IGNORECASE)
+    parts = pattern.split(summary)
+    segments: List[SummarySegment] = []
+
+    for part in parts:
+        if not part:
+            continue
+        is_match = any(part.lower() == phrase.lower() for phrase in phrases)
+        segments.append({"text": part, "highlight": is_match})
+
+    return segments or [{"text": summary, "highlight": False}]
+
+
+def _normalise_summary_payload(content: str, query: str) -> Optional[SummaryPayload]:
+    extracted_json = _extract_json_object(content)
+    if extracted_json:
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                payload = loader(extracted_json)
+            except Exception:
+                payload = None
+            normalized = _coerce_payload(payload)
+            if normalized:
+                if not normalized["summary_segments"]:
+                    normalized["summary_segments"] = _build_fallback_segments(normalized["summary"], query)
+                return normalized
+
+    regex_payload = _extract_summary_and_segments_by_regex(content)
+    if regex_payload:
+        if not regex_payload["summary_segments"]:
+            regex_payload["summary_segments"] = _build_fallback_segments(regex_payload["summary"], query)
+        return regex_payload
+
+    plain_summary = (content or "").strip()
+    if not plain_summary or plain_summary.lower() == "null":
+        return None
+
+    return {
+        "summary": plain_summary,
+        "summary_segments": _build_fallback_segments(plain_summary, query),
+    }
+
+
+async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional[SummaryPayload]:
     if not hits or not LLM_URL or not LLM_MODEL:
         logging.getLogger(__name__).info(
             "LLM summary skipped: hits=%d llm_url_present=%s llm_model_present=%s query=%r",
@@ -145,7 +300,8 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
     except Exception:
         return None
 
-    if not content or content.lower() == "null":
+    payload = _normalise_summary_payload(content, query)
+    if not payload:
         logging.getLogger(__name__).info(
             "LLM summary empty/null response: query=%r raw_content=%r",
             query,
@@ -154,8 +310,9 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
         return None
 
     logging.getLogger(__name__).info(
-        "LLM summary success: query=%r content_preview=%r",
+        "LLM summary success: query=%r content_preview=%r segments=%d",
         query,
-        content[:160],
+        payload["summary"][:160],
+        len(payload["summary_segments"]),
     )
-    return content
+    return payload
