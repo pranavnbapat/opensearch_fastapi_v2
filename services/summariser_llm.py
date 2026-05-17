@@ -16,6 +16,8 @@ SUMMARY_TIMEOUT_S = float(os.getenv("SUMMARY_TIMEOUT_S", "10.0"))
 SUMMARY_MAX_DESC_CHARS = int(os.getenv("SUMMARY_MAX_DESC_CHARS", "250"))
 SUMMARY_MAX_CONCURRENCY = int(os.getenv("SUMMARY_MAX_CONCURRENCY", "4"))
 SUMMARY_TOP_K = int(os.getenv("SUMMARY_TOP_K", "10"))
+SUMMARY_MIN_MAX_TOKENS = int(os.getenv("SUMMARY_MIN_MAX_TOKENS", "100"))
+SUMMARY_MAX_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_MAX_TOKENS", "300"))
 
 _sem = asyncio.Semaphore(SUMMARY_MAX_CONCURRENCY)
 
@@ -65,6 +67,12 @@ def _build_prompt(query: str, hits: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _summary_max_tokens(query: str, hits: List[Dict[str, Any]]) -> int:
+    prompt_chars = len(_build_prompt(query, hits))
+    dynamic_budget = 100 + (prompt_chars // 20)
+    return max(SUMMARY_MIN_MAX_TOKENS, min(SUMMARY_MAX_MAX_TOKENS, dynamic_budget))
+
+
 async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
     if not hits or not LLM_URL or not LLM_MODEL:
         logging.getLogger(__name__).info(
@@ -82,12 +90,14 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
         reverse=True,
     )
     filtered = [hit for hit, score in scored if score > 0][:SUMMARY_TOP_K]
+    max_tokens = _summary_max_tokens(query, filtered) if filtered else SUMMARY_MIN_MAX_TOKENS
     logging.getLogger(__name__).info(
-        "LLM summary relevance filter: query=%r hits=%d filtered=%d top_scores=%s",
+        "LLM summary relevance filter: query=%r hits=%d filtered=%d top_scores=%s max_tokens=%d",
         query,
         len(hits),
         len(filtered),
         [score for _, score in scored[:5]],
+        max_tokens,
     )
     if not filtered:
         return None
@@ -105,7 +115,7 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 180,
+        "max_tokens": max_tokens,
     }
 
     endpoint = LLM_URL.rstrip("/")

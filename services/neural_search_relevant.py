@@ -68,7 +68,7 @@ class RelevantSearchRequest(BaseModel):
     k: Optional[int] = None
     model: Optional[str] = "msmarco"
     include_fulltext: Optional[bool] = False
-    include_summary: Optional[bool] = True
+    include_summary: Optional[bool] = False
     debug_profile: Optional[bool] = False
     debug_explain: Optional[bool] = False
     sort_by: Optional[Union[SortBy, int, str]] = SortBy.score_desc
