@@ -79,6 +79,12 @@ def _log_request_attribution(request: Request, endpoint: str, **extra: object) -
     )
 
 
+def _log_request_boundary(endpoint: str, phase: str, **extra: object) -> None:
+    logger.info("======================================================================")
+    logger.info("[REQUEST %s] endpoint=%s extra=%s", phase, endpoint, extra or {})
+    logger.info("======================================================================")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -136,6 +142,14 @@ HYBRID_ENABLE_PIPELINE = (os.getenv("HYBRID_ENABLE_PIPELINE", "true").strip().lo
           lexical-first mode. Results are grouped at the parent document level.
           """)
 async def neural_search_relevant_endpoint(request_temp: Request, request: RelevantSearchRequest):
+    _log_request_boundary(
+        "/neural_search_relevant",
+        "START",
+        search_term=(request.search_term or "").strip(),
+        page=request.page,
+        dev=bool(request.dev),
+        model=request.model or "msmarco",
+    )
     enforce_trusted_proxy(request_temp, "/neural_search_relevant")
     _log_request_attribution(
         request_temp,
@@ -292,6 +306,17 @@ async def neural_search_relevant_endpoint(request_temp: Request, request: Releva
         response_json=response_json,
         request_k=(request.k if (getattr(request, "k", None) is not None) else None),
         t0=t0,
+    )
+
+    _log_request_boundary(
+        "/neural_search_relevant",
+        "END",
+        search_term=query,
+        page=page_number,
+        translation_allowed=translation_allowed,
+        include_summary=include_summary,
+        summary_present=bool(response_json.get("summary")),
+        results=len(response_json.get("data") or []),
     )
 
     return response_json

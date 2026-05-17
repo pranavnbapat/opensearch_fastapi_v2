@@ -19,7 +19,9 @@ def maybe_translate_query(query: str, translation_allowed: bool) -> str:
     Returns possibly modified query.
     """
     if not translation_allowed:
-        logger.info("No access token provided; skipping translation.")
+        logger.info(
+            "Translation not allowed; skipping translation (missing token, invalid token, wrong dev/prd target, or token validation failure)."
+        )
         return query
 
     try:
@@ -56,6 +58,16 @@ async def resolve_auth_context(access_token: Optional[str], dev: bool, include_s
         translation_allowed = False
 
     include_summary = bool(include_summary_flag) and bool(access_token) and bool(translation_allowed) and (user_id is not None)
+
+    logger.info(
+        "Summary auth context: include_summary_flag=%s access_token_present=%s translation_allowed=%s user_id=%s include_summary=%s dev=%s",
+        bool(include_summary_flag),
+        bool(access_token),
+        bool(translation_allowed),
+        user_id,
+        bool(include_summary),
+        bool(dev),
+    )
 
     return translation_allowed, include_summary, user_id
 
@@ -198,12 +210,44 @@ async def build_response_json(
     summary = None
     if include_summary and summary_provider == "hf":
         # Caller ensures auth eligibility; here we just compute.
+        logger.info(
+            "Summary generation starting: provider=hf query=%r results=%d index=%s page=%d",
+            query,
+            len(formatted_results),
+            index_name,
+            page_number,
+        )
         summary = summarise_top5_hf_fn(query=query, hits=formatted_results)
     elif include_summary and summary_provider == "llm" and summarise_topk_llm_fn is not None:
+        logger.info(
+            "Summary generation starting: provider=llm query=%r results=%d index=%s page=%d",
+            query,
+            len(formatted_results),
+            index_name,
+            page_number,
+        )
         try:
             summary = await summarise_topk_llm_fn(query=query, hits=formatted_results)
         except Exception:
+            logger.exception("Summary generation crashed: provider=llm query=%r", query)
             summary = None
+    else:
+        logger.info(
+            "Summary generation skipped: include_summary=%s provider=%s has_llm_fn=%s query=%r results=%d",
+            bool(include_summary),
+            summary_provider,
+            summarise_topk_llm_fn is not None,
+            query,
+            len(formatted_results),
+        )
+
+    logger.info(
+        "Summary generation finished: provider=%s query=%r summary_present=%s summary_preview=%r",
+        summary_provider,
+        query,
+        bool(summary),
+        (summary[:160] if isinstance(summary, str) else summary),
+    )
 
     response_json = {
         "summary": summary,

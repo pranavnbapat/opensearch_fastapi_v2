@@ -67,6 +67,13 @@ def _build_prompt(query: str, hits: List[Dict[str, Any]]) -> str:
 
 async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional[str]:
     if not hits or not LLM_URL or not LLM_MODEL:
+        logging.getLogger(__name__).info(
+            "LLM summary skipped: hits=%d llm_url_present=%s llm_model_present=%s query=%r",
+            len(hits) if hits else 0,
+            bool(LLM_URL),
+            bool(LLM_MODEL),
+            query,
+        )
         return None
 
     scored = sorted(
@@ -75,6 +82,13 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
         reverse=True,
     )
     filtered = [hit for hit, score in scored if score > 0][:SUMMARY_TOP_K]
+    logging.getLogger(__name__).info(
+        "LLM summary relevance filter: query=%r hits=%d filtered=%d top_scores=%s",
+        query,
+        len(hits),
+        len(filtered),
+        [score for _, score in scored[:5]],
+    )
     if not filtered:
         return None
 
@@ -104,6 +118,12 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
         async with _sem:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(endpoint, headers=headers, json=payload)
+                logging.getLogger(__name__).info(
+                    "LLM summary HTTP response: endpoint=%s status=%s query=%r",
+                    endpoint,
+                    response.status_code,
+                    query,
+                )
                 response.raise_for_status()
                 data = response.json()
     except Exception as exc:
@@ -116,6 +136,16 @@ async def summarise_topk_llm(query: str, hits: List[Dict[str, Any]]) -> Optional
         return None
 
     if not content or content.lower() == "null":
+        logging.getLogger(__name__).info(
+            "LLM summary empty/null response: query=%r raw_content=%r",
+            query,
+            content,
+        )
         return None
 
+    logging.getLogger(__name__).info(
+        "LLM summary success: query=%r content_preview=%r",
+        query,
+        content[:160],
+    )
     return content
